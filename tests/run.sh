@@ -27,6 +27,7 @@ readonly FAKE_HOME="$WORK/home"
 readonly PASS_LOG="$WORK/pass.log"
 readonly FAIL_LOG="$WORK/fail.log"
 readonly SKIP_LOG="$WORK/skip.log"
+readonly ZERO=0000000000000000000000000000000000000000
 mkdir -p -- "$SHARED_RUNNER_TEMP" "$FAKE_HOME"
 : >"$PASS_LOG"
 : >"$FAIL_LOG"
@@ -152,6 +153,161 @@ write_event_pull_request() {
 
 write_event_other() {
 	jq -n '{}' >"$1"
+}
+
+# git_in <repo> <args...>: git with a fixed identity, for fixture history.
+git_in() {
+	local repo=$1
+	shift
+	git -C "$repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+		-c commit.gpgsign=false "$@"
+}
+
+# write_file <repo> <path> <content>: write and stage, no commit.
+write_file() {
+	local repo=$1 path=$2 content=$3
+	mkdir -p -- "$(dirname -- "$repo/$path")"
+	printf '%s\n' "$content" >"$repo/$path"
+	git -C "$repo" add -- "$path"
+}
+
+# evil_merge_repo <secret>: main and a side branch merge cleanly, and the
+# merge commit alone adds the secret. Prints "<repo> <before> <merge>".
+evil_merge_repo() {
+	local repo before merge
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	git -C "$repo" branch side
+	before=$(commit_file "$repo" main.txt "main change")
+	git -C "$repo" checkout -q side
+	commit_file "$repo" side.txt "side change" >/dev/null
+	git -C "$repo" checkout -q main
+	git_in "$repo" merge -q --no-ff --no-commit side
+	write_file "$repo" app.env "API_TOKEN=$1"
+	git_in "$repo" commit -q -m "merge side"
+	merge=$(git -C "$repo" rev-parse HEAD)
+	printf '%s %s %s\n' "$repo" "$before" "$merge"
+}
+
+# conflict_merge_repo <secret>: both branches edit one line; the conflict
+# resolution alone introduces the secret. Prints "<repo> <before> <merge>".
+conflict_merge_repo() {
+	local repo before merge
+	repo=$(new_repo)
+	commit_file "$repo" app.env "API_TOKEN=unset" >/dev/null
+	git -C "$repo" branch side
+	before=$(commit_file "$repo" app.env "API_TOKEN=main")
+	git -C "$repo" checkout -q side
+	commit_file "$repo" app.env "API_TOKEN=side" >/dev/null
+	git -C "$repo" checkout -q main
+	git_in "$repo" merge -q side >/dev/null 2>&1 && {
+		echo "conflict_merge_repo: merge did not conflict" >&2
+		return 1
+	}
+	write_file "$repo" app.env "API_TOKEN=$1"
+	git_in "$repo" commit -q --no-edit
+	merge=$(git -C "$repo" rev-parse HEAD)
+	printf '%s %s %s\n' "$repo" "$before" "$merge"
+}
+
+# scoped_pr_repo <secret>: main once held the secret (added, then removed);
+# a PR branch from before that merges main back in. Prints
+# "<repo> <base> <head>" for a PR whose range holds no secret.
+scoped_pr_repo() {
+	local repo base head
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	git -C "$repo" branch feature
+	commit_file "$repo" app.env "API_TOKEN=$1" >/dev/null
+	base=$(commit_file "$repo" app.env "API_TOKEN=unset")
+	git -C "$repo" checkout -q feature
+	commit_file "$repo" feature.txt "feature change" >/dev/null
+	git_in "$repo" merge -q --no-ff --no-edit main
+	head=$(git -C "$repo" rev-parse HEAD)
+	git -C "$repo" checkout -q main
+	printf '%s %s %s\n' "$repo" "$base" "$head"
+}
+
+# long_pr_repo <secret> <n>: a PR of <n> commits whose first commit holds the
+# secret. Prints "<repo> <base> <head>".
+long_pr_repo() {
+	local repo base head i
+	repo=$(new_repo)
+	base=$(commit_file "$repo" README.md "fixture")
+	commit_file "$repo" app.env "API_TOKEN=$1" >/dev/null
+	for ((i = 2; i <= $2; i++)); do
+		head=$(commit_file "$repo" "notes/$i.txt" "change $i")
+	done
+	printf '%s %s %s\n' "$repo" "$base" "$head"
+}
+
+# nul_byte_secret_repo <secret>: the secret sits in a file git calls binary
+# only because of a NUL byte. The name keeps a text extension: gitleaks's
+# default config skips paths with binary extensions (.bin, ...) by name.
+nul_byte_secret_repo() {
+	local repo
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	printf 'API_TOKEN=%s\n\000\n' "$1" >"$repo/app.env"
+	git -C "$repo" add -- app.env
+	git_in "$repo" commit -q -m "add app.env"
+	printf '%s\n' "$repo"
+}
+
+# attributes_repo [secret]: a tracked .gitattributes marks every file -diff;
+# with a secret, a later commit adds it.
+attributes_repo() {
+	local repo
+	repo=$(new_repo)
+	commit_file "$repo" .gitattributes "* -diff" >/dev/null
+	if [[ $# -gt 0 ]]; then
+		commit_file "$repo" app.env "API_TOKEN=$1" >/dev/null
+	else
+		commit_file "$repo" app.env "API_TOKEN=unset" >/dev/null
+	fi
+	printf '%s\n' "$repo"
+}
+
+# gitconfig_home <attributes line> [gitconfig lines]: a HOME whose
+# ~/.gitconfig points core.attributesFile at a file holding <attributes line>.
+gitconfig_home() {
+	local dir
+	dir=$(mktemp -d "$WORK/home.XXXXXX")
+	printf '%s\n' "$1" >"$dir/attributes"
+	printf '[core]\n\tattributesFile = %s\n%s\n' "$dir/attributes" "${2:-}" >"$dir/.gitconfig"
+	printf '%s\n' "$dir"
+}
+
+# ignored_secret_repo <secret_repo>: a full clone of <secret_repo> whose
+# .gitleaksignore lists the fingerprint of the secret's finding.
+ignored_secret_repo() {
+	local repo sha
+	repo=$(mktemp -d "$WORK/repo.XXXXXX")
+	git clone -q -- "file://$1" "$repo"
+	sha=$(git -C "$repo" log -n 1 --format=%H -- app.env)
+	commit_file "$repo" .gitleaksignore "$sha:app.env:github-pat:1" >/dev/null
+	printf '%s\n' "$repo"
+}
+
+# corrupt_history_repo: HEAD exists but its parent commit object is gone.
+corrupt_history_repo() {
+	local repo parent
+	repo=$(new_repo)
+	parent=$(commit_file "$repo" README.md "fixture")
+	commit_file "$repo" notes.txt "change" >/dev/null
+	rm -f -- "$repo/.git/objects/${parent:0:2}/${parent:2}"
+	printf '%s\n' "$repo"
+}
+
+# run_floor_summary <repo> <subcommand> [NAME=VALUE...]: run_floor with a job
+# summary file, then print the summary with each line prefixed "summary: ".
+run_floor_summary() {
+	local repo=$1 sub=$2 summary rc=0
+	shift 2
+	summary=$(mktemp "$WORK/summary.XXXXXX")
+	run_floor "$repo" "$sub" GITHUB_STEP_SUMMARY="$summary" "$@" || rc=$?
+	sed 's/^/summary: /' -- "$summary"
+	return "$rc"
 }
 
 vulnerable_npm_lockfile() {
@@ -476,6 +632,61 @@ commit_file "$secret_repo" app.env "API_TOKEN=$secret" >/dev/null
 secret_head=$(git -C "$secret_repo" rev-parse HEAD)
 write_event_push "$push_event" "$clean_head" "$secret_head"
 
+# Scan range fixtures. range_repo: clean root, then the secret, then a clean
+# commit on top.
+range_repo=$(new_repo)
+range_c1=$(commit_file "$range_repo" README.md "fixture repository")
+range_c2=$(commit_file "$range_repo" app.env "API_TOKEN=$secret")
+range_c3=$(commit_file "$range_repo" notes.txt "later change")
+unknown_sha=$(printf '%s' "$secret" | sha1sum | cut -d' ' -f1)
+read -r evil_repo evil_before evil_merge < <(evil_merge_repo "$secret")
+read -r conflict_repo conflict_before conflict_merge < <(conflict_merge_repo "$secret")
+read -r scoped_repo scoped_base scoped_head < <(scoped_pr_repo "$secret")
+read -r long_repo long_base long_head < <(long_pr_repo "$secret" 35)
+shallow_repo=$(mktemp -d "$WORK/repo.XXXXXX")
+git clone -q --depth 1 -- "file://$range_repo" "$shallow_repo"
+bad_config_repo=$(new_repo)
+commit_file "$bad_config_repo" .gitleaks.toml "[[rules]" >/dev/null
+nul_repo=$(nul_byte_secret_repo "$secret")
+attr_secret_repo=$(attributes_repo "$secret")
+attr_clean_repo=$(attributes_repo)
+ignored_repo=$(ignored_secret_repo "$secret_repo")
+corrupt_repo=$(corrupt_history_repo)
+corrupt_head=$(git -C "$corrupt_repo" rev-parse HEAD)
+no_diff_home=$(gitconfig_home '* -diff')
+textconv_home=$(gitconfig_home '* diff=hide' "$(printf '[diff "hide"]\n\ttextconv = true')")
+# shellcheck disable=SC2016 # literal stub text
+old_git_stub='git=[ "$1" = version ] && { echo "git version 2.35.8"; exit 0; }; exec /usr/bin/git "$@"'
+
+# push_event / pr_event <name> <sha> <sha>: write an event file, print its path.
+push_event() {
+	write_event_push "$WORK/event-$1.json" "$2" "$3"
+	printf '%s\n' "$WORK/event-$1.json"
+}
+pr_event() {
+	write_event_pull_request "$WORK/event-$1.json" "$2" "$3"
+	printf '%s\n' "$WORK/event-$1.json"
+}
+ev_push_range=$(push_event push-range "$range_c1" "$range_c3")
+ev_push_after_secret=$(push_event push-after-secret "$range_c2" "$range_c3")
+ev_first_push=$(push_event first-push "$ZERO" "$secret_head")
+ev_force_push=$(push_event force-push "$unknown_sha" "$range_c3")
+ev_option_before=$(push_event option-before "--output=$WORK/x" "$range_c3")
+ev_delete=$(push_event delete "$range_c3" "$ZERO")
+ev_after_missing="$WORK/event-after-missing.json"
+jq -n --arg b "$range_c1" '{before: $b}' >"$ev_after_missing"
+ev_after_unknown=$(push_event after-unknown "$range_c1" "$unknown_sha")
+ev_after_upper=$(push_event after-upper "$range_c1" "${range_c3^^}")
+ev_evil=$(push_event evil "$evil_before" "$evil_merge")
+ev_conflict=$(push_event conflict "$conflict_before" "$conflict_merge")
+ev_corrupt=$(push_event corrupt "$ZERO" "$corrupt_head")
+ev_pr_long=$(pr_event pr-long "$long_base" "$long_head")
+ev_pr_scoped=$(pr_event pr-scoped "$scoped_base" "$scoped_head")
+ev_pr_after_secret=$(pr_event pr-after-secret "$range_c2" "$range_c3")
+ev_pr_head_newline=$(pr_event pr-head-newline "$range_c2" "$range_c3"$'\n')
+ev_pr_missing="$WORK/event-pr-missing.json"
+jq -n --arg h "$range_c3" '{pull_request: {head: {sha: $h}}}' >"$ev_pr_missing"
+
 tar_to_command=$(tar_to_command_script)
 no_diff_attributes="$WORK/no-diff.attributes"
 printf '* -diff\n' >"$no_diff_attributes"
@@ -591,6 +802,92 @@ expect osv-path-shadow-vulnerable-red 1 "FAIL: osv: scan failed" -- \
 	"$osv_vuln_repo" osv
 expect gitleaks-secret-redacted 1 "github-pat" --absent "$secret" -- \
 	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$push_event"
+
+# Scan range: push.
+expect push-range-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_push_range"
+expect push-secret-before-before-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_push_after_secret"
+expect push-first-push-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_first_push"
+expect push-force-fallback-secret-red 1 "summary: - mode: fallback, 'before' is not a commit" -- \
+	run_floor_summary "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_force_push"
+expect push-force-fallback-leaks-red 1 "summary: - result: FAIL, leaks found" -- \
+	run_floor_summary "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_force_push"
+expect push-option-shaped-before-fallback-red 1 "mode fallback, 'before' is not a commit" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_option_before"
+expect push-branch-delete-notice-green 0 "::notice title=security-floor::push deletes a ref" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_delete"
+expect push-after-missing-red 1 "FAIL: push event: 'after' is missing, malformed or not a commit" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_after_missing"
+expect push-after-unknown-red 1 "FAIL: push event: 'after' is missing, malformed or not a commit" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_after_unknown"
+expect push-after-uppercase-red 1 "FAIL: push event: 'after' is missing, malformed or not a commit" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_after_upper"
+expect push-event-file-missing-red 1 "FAIL: push event: 'after' is missing, malformed or not a commit" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$WORK/absent.json"
+expect push-evil-merge-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$evil_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_evil"
+expect push-conflict-merge-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$conflict_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_conflict"
+expect push-range-unresolvable-red 1 "FAIL: scan range does not resolve" -- \
+	run_floor "$corrupt_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_corrupt"
+
+# Scan range: pull request.
+expect pr-35-commits-secret-in-first-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$long_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_long"
+expect pr-merged-base-with-old-secret-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$scoped_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_scoped"
+expect pr-merged-base-repo-full-history-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$scoped_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect pr-range-after-secret-green 0 "mode pull request range" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_after_secret"
+expect pr-head-malformed-full-history-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_head_newline"
+expect pr-base-missing-full-history-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_missing"
+
+# Scan range: other events, preflight, tool errors.
+expect schedule-old-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$range_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect no-event-old-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$range_repo" gitleaks
+expect shallow-clone-red 1 "FAIL: checkout needs fetch-depth: 0" -- \
+	run_floor "$shallow_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect git-too-old-red 1 "FAIL: git 2.36 or newer is required" -- \
+	run_floor_script "$(floor_with_stubs_on_path "$old_git_stub")" "$clean_repo" gitleaks
+expect malformed-gitleaks-toml-red 1 "FAIL: gitleaks error (exit 1): tool or config failure" -- \
+	run_floor "$bad_config_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect gitleaksignore-fingerprint-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$ignored_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect gitleaksignore-absent-same-history-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# Content git would print as "Binary files differ" is still scanned.
+expect attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$attr_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect nul-byte-file-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$nul_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect attributes-no-diff-clean-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$attr_clean_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect home-gitconfig-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks HOME="$no_diff_home"
+expect home-gitconfig-textconv-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks HOME="$textconv_home"
+expect home-gitconfig-textconv-clean-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$clean_repo" gitleaks HOME="$textconv_home"
+
+# The scan trusts the workspace through its own safe.directory, not a HOME
+# config. git's test knob models a checkout owned by another user; the
+# control points safe.directory elsewhere and must be refused.
+# shellcheck disable=SC2016 # literal source text
+expect foreign-owner-workspace-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor_script "$(floor_copy_with '"GIT_CONFIG_VALUE_0=$workspace"' \
+		'GIT_TEST_ASSUME_DIFFERENT_OWNER=1 "GIT_CONFIG_VALUE_0=$workspace"')" "$secret_repo" gitleaks
+# shellcheck disable=SC2016 # literal source text
+expect foreign-owner-untrusted-path-red 1 "FAIL: not a usable git checkout" -- \
+	run_floor_script "$(floor_copy_with '"GIT_CONFIG_VALUE_0=$workspace"' \
+		'GIT_TEST_ASSUME_DIFFERENT_OWNER=1 "GIT_CONFIG_VALUE_0=$workspace/elsewhere"')" "$secret_repo" gitleaks
 
 # Source text: pins are literals, never read from the environment.
 expect source-pins-literal 0 "pins are literal" -- check_pins_literal "$FLOOR_SH"

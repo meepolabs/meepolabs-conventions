@@ -16,7 +16,8 @@ set -euo pipefail
 readonly FLOOR_PATH=/usr/bin:/bin
 if [[ "${SECURITY_FLOOR_REEXEC_PID:-}" != "$$" ]]; then
 	floor_env=(PATH="$FLOOR_PATH" LC_ALL=C SECURITY_FLOOR_REEXEC_PID="$$")
-	# git reads its global config (safe.directory on runners) from HOME.
+	# Kept for tools that resolve per-user paths. The secret scan does not
+	# read git's user or system config (isolate_git_config).
 	[[ -v HOME ]] && floor_env+=("HOME=$HOME")
 	# Cache and work directory root; TMPDIR is the fallback when it is unset.
 	[[ -v RUNNER_TEMP ]] && floor_env+=("RUNNER_TEMP=$RUNNER_TEMP")
@@ -71,10 +72,26 @@ readonly OSV_VERSION="2.6.0"
 readonly OSV_URL="https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64"
 readonly OSV_SHA256="ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108"
 
+# gitleaks passes --log-opts to `git log -p` split on single spaces, and the
+# option replaces its default full-history arguments. Plain `git log -p`
+# prints no diff for merge commits (--remerge-diff) and only "Binary files
+# differ" for files git or .gitattributes call binary (--text).
+readonly SCAN_OPTS="--full-history --diff-filter=tuxdb --remerge-diff --text"
+readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=tuxdb --remerge-diff --text"
+readonly ZERO_SHA="0000000000000000000000000000000000000000"
+readonly GIT_MIN_MAJOR=2
+readonly GIT_MIN_MINOR=36
+
 BASE_DIR=""
 OWNS_BASE_DIR=false
 CACHE_DIR=""
 WORK_DIR=""
+GIT_ENV=()
+SCAN_EVENT=""
+SCAN_MODE=""
+SCAN_RANGE=""
+SCAN_LOG_OPTS=""
+SCAN_REVS=()
 
 usage() {
 	echo "usage: floor.sh gitleaks|osv" >&2
@@ -199,14 +216,160 @@ install_osv() {
 	check_version osv-scanner "osv-scanner version: $OSV_VERSION" "${out%%$'\n'*}"
 }
 
+# git and gitleaks read no system or user git config: a gitconfig under HOME
+# or /etc can hide diffs from `git log -p` (a textconv driver, an attributes
+# file). That also drops any global safe.directory, so the workspace is
+# trusted here explicitly. Set per command, never exported: the process
+# environment stays exactly what assert_sanitized_env checked.
+init_git_env() {
+	local workspace
+	workspace=$(pwd -P) || fail "cannot resolve the workspace path"
+	GIT_ENV=(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+		GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$workspace")
+}
+
+git_isolated() {
+	env "${GIT_ENV[@]}" git "$@"
+}
+
+preflight_git() {
+	local shallow version
+	shallow=$(git_isolated rev-parse --is-shallow-repository) ||
+		scan_fail "not a usable git checkout: $(pwd -P)"
+	[[ "$shallow" != true ]] || scan_fail "checkout needs fetch-depth: 0 (the clone is shallow)"
+	[[ "$shallow" == false ]] || scan_fail "cannot tell whether the clone is shallow"
+	version=$(git_isolated version) || scan_fail "cannot determine the git version"
+	[[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] ||
+		scan_fail "cannot parse the git version: $version"
+	if ((BASH_REMATCH[1] < GIT_MIN_MAJOR ||
+		(BASH_REMATCH[1] == GIT_MIN_MAJOR && BASH_REMATCH[2] < GIT_MIN_MINOR))); then
+		scan_fail "git $GIT_MIN_MAJOR.$GIT_MIN_MINOR or newer is required (--remerge-diff); found: $version"
+	fi
+}
+
+# event_sha <jq path array>: the event field at that path when it is a
+# lowercase 40-hex string, else nothing. A missing, unreadable or invalid
+# event file yields nothing; callers decide whether that widens or fails.
+# The path must be absolute so jq can never read it as an option.
+event_sha() {
+	local path=${GITHUB_EVENT_PATH:-} value
+	[[ "$path" == /* && -f "$path" && -r "$path" ]] || return 0
+	value=$(jq -j --argjson p "$1" \
+		'try getpath($p) catch null | select(type == "string" and test("\\A[0-9a-f]{40}\\z"))' \
+		"$path" 2>/dev/null) || return 0
+	[[ "$value" =~ ^[0-9a-f]{40}$ ]] && printf '%s' "$value"
+	return 0
+}
+
+is_commit() {
+	[[ "$1" =~ ^[0-9a-f]{40}$ ]] && git_isolated cat-file -e "$1^{commit}" 2>/dev/null
+}
+
+use_full_history() {
+	SCAN_MODE=$1
+	SCAN_RANGE="all refs"
+	SCAN_LOG_OPTS=$FULL_HISTORY_OPTS
+	SCAN_REVS=(--all)
+}
+
+# use_revs <mode> <rev>: <rev> is built only from SHAs that passed is_commit.
+use_revs() {
+	SCAN_MODE=$1
+	SCAN_RANGE=$2
+	SCAN_LOG_OPTS="$SCAN_OPTS $2"
+	SCAN_REVS=("$2")
+}
+
+select_push_range() {
+	local before after
+	before=$(event_sha '["before"]')
+	after=$(event_sha '["after"]')
+	if [[ "$after" == "$ZERO_SHA" ]]; then
+		SCAN_MODE="branch deletion"
+		return
+	fi
+	is_commit "$after" ||
+		scan_fail "push event: 'after' is missing, malformed or not a commit in the checkout"
+	if [[ "$before" == "$ZERO_SHA" ]]; then
+		use_revs "new ref, everything reachable from 'after'" "$after"
+	elif is_commit "$before"; then
+		use_revs "push range" "$before..$after"
+	else
+		use_revs "fallback, 'before' is not a commit in the checkout; everything reachable from 'after'" "$after"
+	fi
+}
+
+select_pull_request_range() {
+	local base head
+	base=$(event_sha '["pull_request","base","sha"]')
+	head=$(event_sha '["pull_request","head","sha"]')
+	if is_commit "$base" && is_commit "$head"; then
+		use_revs "pull request range" "$base..$head"
+	else
+		use_full_history "fallback, pull request base or head is not a commit in the checkout; full history"
+	fi
+}
+
+select_scan_range() {
+	local event=${GITHUB_EVENT_NAME:-}
+	SCAN_EVENT=${event:-none}
+	[[ "$SCAN_EVENT" =~ ^[a-z_]{1,64}$ ]] || SCAN_EVENT="unrecognized"
+	case "$event" in
+	push) select_push_range ;;
+	pull_request) select_pull_request_range ;;
+	*) use_full_history "full history" ;;
+	esac
+}
+
+# gitleaks treats an unknown revision in --log-opts as an empty scan and
+# exits 0, so the range must resolve before it runs.
+preflight_scan_range() {
+	local count
+	count=$(git_isolated rev-list --count "${SCAN_REVS[@]}" --) ||
+		scan_fail "scan range does not resolve: $SCAN_RANGE"
+	info "scan: event $SCAN_EVENT; mode $SCAN_MODE; range $SCAN_RANGE; $count commits"
+}
+
+write_gitleaks_summary() {
+	local result=$1
+	[[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+	printf '### security-floor: gitleaks\n\n- gitleaks: %s\n- event: %s\n- mode: %s\n- range: %s\n- result: %s\n\n' \
+		"$GITLEAKS_VERSION" "$SCAN_EVENT" "$SCAN_MODE" "${SCAN_RANGE:-none}" "$result" \
+		>>"$GITHUB_STEP_SUMMARY" || info "warning: cannot write the job summary"
+}
+
+scan_fail() {
+	write_gitleaks_summary "FAIL, $*"
+	fail "$@"
+}
+
 run_gitleaks() {
 	local rc=0
+	init_git_env
+	preflight_git
+	select_scan_range
+	if [[ "$SCAN_MODE" == "branch deletion" ]]; then
+		printf '::notice title=security-floor::push deletes a ref; nothing to scan\n'
+		write_gitleaks_summary "pass (nothing to scan)"
+		pass "gitleaks: branch deletion, nothing to scan"
+	fi
+	preflight_scan_range
 	install_gitleaks
-	"$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner . || rc=$?
+	env "${GIT_ENV[@]}" "$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner \
+		--log-opts "$SCAN_LOG_OPTS" . || rc=$?
 	case "$rc" in
-	0) pass "gitleaks: no leaks found" ;;
-	2) fail "gitleaks: leaks found" ;;
-	*) fail "gitleaks: scan error (exit $rc)" ;;
+	0)
+		write_gitleaks_summary "pass, no leaks found"
+		pass "gitleaks: no leaks found"
+		;;
+	2)
+		write_gitleaks_summary "FAIL, leaks found"
+		fail "gitleaks: leaks found"
+		;;
+	*)
+		write_gitleaks_summary "FAIL, gitleaks error (exit $rc)"
+		fail "gitleaks error (exit $rc): tool or config failure"
+		;;
 	esac
 }
 
