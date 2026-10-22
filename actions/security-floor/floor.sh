@@ -7,6 +7,11 @@
 set -euo pipefail
 umask 077
 
+# Narrows, does not close, what an earlier step in the same job can inject:
+# a shadowing tool on PATH or a gitleaks config that allowlists everything.
+export PATH=/usr/bin:/bin
+unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+
 # Tool pins. Literals only: a version, URL or hash read from the environment
 # would be a bypass that leaves no diff (tests/run.sh enforces this).
 readonly GITLEAKS_VERSION="8.30.1"
@@ -49,8 +54,8 @@ cleanup() {
 
 check_platform() {
 	local os arch
-	os=$(uname -s)
-	arch=$(uname -m)
+	os=$(uname -s) || fail "cannot determine platform"
+	arch=$(uname -m) || fail "cannot determine platform"
 	if [[ "$os" != "Linux" || "$arch" != "x86_64" ]]; then
 		fail "unsupported platform: $os $arch (only Linux x86_64 is supported)"
 	fi
@@ -64,12 +69,25 @@ prepare_dirs() {
 		[[ "$runner_temp" == /* ]] || fail "RUNNER_TEMP must be an absolute path"
 		BASE_DIR="$runner_temp"
 	else
-		BASE_DIR=$(mktemp -d)
+		BASE_DIR=$(mktemp -d) || fail "cannot create temp directory"
 		OWNS_BASE_DIR=true
 	fi
-	CACHE_DIR="$BASE_DIR/security-floor/bin"
-	mkdir -p -- "$CACHE_DIR"
-	WORK_DIR=$(mktemp -d "$BASE_DIR/security-floor/run.XXXXXX")
+	local floor_dir="$BASE_DIR/security-floor"
+	CACHE_DIR="$floor_dir/bin"
+	mkdir -p -- "$CACHE_DIR" || fail "cannot create cache directory: $CACHE_DIR"
+	require_private_dir "$floor_dir"
+	require_private_dir "$CACHE_DIR"
+	WORK_DIR=$(mktemp -d "$floor_dir/run.XXXXXX") || fail "cannot create run directory in $floor_dir"
+	chmod 0700 -- "$WORK_DIR" || fail "cannot restrict run directory: $WORK_DIR"
+}
+
+# A pre-planted symlink or foreign-owned directory would let someone else
+# choose the bytes this run caches and executes.
+require_private_dir() {
+	local dir=$1
+	[[ ! -L "$dir" && -d "$dir" && -O "$dir" ]] ||
+		fail "unsafe cache directory: $dir (symlink, not a directory, or not owned by the current user)"
+	chmod 0700 -- "$dir" || fail "cannot restrict cache directory: $dir"
 }
 
 verify_sha256() {
@@ -98,14 +116,14 @@ fetch_verified() {
 	local url=$1 sha=$2 label=$3 dest=$4
 	local cached="$CACHE_DIR/$sha"
 	if [[ -f "$cached" ]]; then
-		cp -- "$cached" "$dest"
+		cp -- "$cached" "$dest" || fail "cache read failed: $label"
 		verify_sha256 "$dest" "$sha" "cached $label"
 		return
 	fi
 	download "$url" "$dest"
 	verify_sha256 "$dest" "$sha" "downloaded $label"
-	cp -- "$dest" "$cached.tmp.$$"
-	mv -f -- "$cached.tmp.$$" "$cached"
+	cp -- "$dest" "$cached.tmp.$$" || fail "cache write failed: $label"
+	mv -f -- "$cached.tmp.$$" "$cached" || fail "cache write failed: $label"
 }
 
 check_version() {
@@ -117,8 +135,8 @@ check_version() {
 install_gitleaks() {
 	local asset="$WORK_DIR/gitleaks.tar.gz" bin="$WORK_DIR/gitleaks" out
 	fetch_verified "$GITLEAKS_URL" "$GITLEAKS_SHA256" "gitleaks $GITLEAKS_VERSION" "$asset"
-	tar -xzf "$asset" -C "$WORK_DIR" --no-same-owner gitleaks
-	chmod 0700 "$bin"
+	tar -xzf "$asset" -C "$WORK_DIR" --no-same-owner gitleaks || fail "extract failed: gitleaks $GITLEAKS_VERSION"
+	chmod 0700 "$bin" || fail "cannot make gitleaks executable"
 	out=$("$bin" version) || fail "gitleaks version check failed"
 	check_version gitleaks "$GITLEAKS_VERSION" "$out"
 }
@@ -126,7 +144,7 @@ install_gitleaks() {
 install_osv() {
 	local bin="$WORK_DIR/osv-scanner" out
 	fetch_verified "$OSV_URL" "$OSV_SHA256" "osv-scanner $OSV_VERSION" "$bin"
-	chmod 0700 "$bin"
+	chmod 0700 "$bin" || fail "cannot make osv-scanner executable"
 	out=$("$bin" --version) || fail "osv-scanner version check failed"
 	check_version osv-scanner "osv-scanner version: $OSV_VERSION" "${out%%$'\n'*}"
 }
@@ -142,10 +160,13 @@ run_gitleaks() {
 	esac
 }
 
+# An empty --config replaces any osv-scanner.toml in the scanned tree, so a
+# repo cannot ignore its own advisories.
 run_osv() {
-	local rc=0
+	local rc=0 config="$WORK_DIR/osv-scanner.toml"
 	install_osv
-	"$WORK_DIR/osv-scanner" scan source -r . || rc=$?
+	: >"$config" || fail "cannot write osv-scanner config"
+	"$WORK_DIR/osv-scanner" scan source --config "$config" -r . || rc=$?
 	case "$rc" in
 	0) pass "osv: no known vulnerabilities" ;;
 	*) fail "osv: scan failed (exit $rc)" ;;

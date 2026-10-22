@@ -144,6 +144,42 @@ write_event_other() {
 	jq -n '{}' >"$1"
 }
 
+vulnerable_npm_lockfile() {
+	cat <<'EOF'
+{
+  "name": "fixture",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "fixture",
+      "version": "1.0.0",
+      "dependencies": {
+        "lodash": "4.17.15"
+      }
+    },
+    "node_modules/lodash": {
+      "version": "4.17.15",
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz",
+      "integrity": "sha512-8xOcRHvCjnocdS5cpwXQXVzmmh5e5+saE2QGoeQmbKmRS6J3VQppPOIt0MnmE+4xlZoumy0GPG0D0MVIQbNA1A=="
+    }
+  }
+}
+EOF
+}
+
+# osv_ignore_package_toml <name>: an osv-scanner.toml that ignores every
+# advisory for one npm package.
+osv_ignore_package_toml() {
+	printf '[[PackageOverrides]]\nname = "%s"\necosystem = "npm"\nignore = true\nreason = "fixture"\n' "$1"
+}
+
+# A gitleaks config that allowlists every path.
+gitleaks_allow_all_toml() {
+	printf '[allowlist]\npaths = [".*"]\n'
+}
+
 clean_npm_lockfile() {
 	cat <<'EOF'
 {
@@ -188,6 +224,33 @@ floor_copy_with() {
 	printf '%s\n' "$dir/floor.sh"
 }
 
+# floor_with_stubs_on_path <name=script>...: a floor.sh copy whose fixed PATH
+# puts the stubs first. Models a shadowing binary inside a trusted PATH entry,
+# which an environment PATH can no longer reach.
+floor_with_stubs_on_path() {
+	local dir
+	dir=$(stub_dir "$@")
+	floor_copy_with 'export PATH=/usr/bin:/bin' "export PATH=$dir:/usr/bin:/bin"
+}
+
+# tar_shim_dir: a `tar` that ignores the archive and writes, into the -C
+# directory, a gitleaks that reports the pinned version and finds nothing.
+tar_shim_dir() {
+	local dir
+	dir=$(mktemp -d "$WORK/stubs.XXXXXX")
+	cat >"$dir/tar" <<'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+	[ "$1" = -C ] && dest=$2
+	shift
+done
+printf '#!/bin/sh\n[ "$1" = version ] && echo 8.30.1\nexit 0\n' >"$dest/gitleaks"
+chmod 0700 "$dest/gitleaks"
+EOF
+	chmod 0755 "$dir/tar"
+	printf '%s\n' "$dir"
+}
+
 # curlrc_home <proxy>: a HOME whose .curlrc routes curl through <proxy>.
 curlrc_home() {
 	local dir
@@ -198,6 +261,17 @@ curlrc_home() {
 
 fresh_runner_temp() {
 	mktemp -d "$WORK/runner-temp.XXXXXX"
+}
+
+# runner_temp_with_symlink <relative path>: a fresh RUNNER_TEMP in which that
+# path is a symlink to a directory elsewhere.
+runner_temp_with_symlink() {
+	local dir target
+	dir=$(fresh_runner_temp)
+	target=$(mktemp -d "$WORK/symlink-target.XXXXXX")
+	mkdir -p -- "$(dirname -- "$dir/$1")"
+	ln -s -- "$target" "$dir/$1"
+	printf '%s\n' "$dir"
 }
 
 tampered_cache_copy() {
@@ -320,6 +394,20 @@ osv_repo=$(new_repo)
 commit_file "$osv_repo" package.json '{"name": "fixture", "version": "1.0.0", "dependencies": {"is-number": "7.0.0"}}' >/dev/null
 commit_file "$osv_repo" package-lock.json "$(clean_npm_lockfile)" >/dev/null
 
+osv_clean_ignore_repo=$(new_repo)
+commit_file "$osv_clean_ignore_repo" package-lock.json "$(clean_npm_lockfile)" >/dev/null
+commit_file "$osv_clean_ignore_repo" osv-scanner.toml "$(osv_ignore_package_toml is-number)" >/dev/null
+
+osv_vuln_repo=$(new_repo)
+commit_file "$osv_vuln_repo" package-lock.json "$(vulnerable_npm_lockfile)" >/dev/null
+
+osv_vuln_ignore_repo=$(new_repo)
+commit_file "$osv_vuln_ignore_repo" package-lock.json "$(vulnerable_npm_lockfile)" >/dev/null
+commit_file "$osv_vuln_ignore_repo" osv-scanner.toml "$(osv_ignore_package_toml lodash)" >/dev/null
+
+gitleaks_allow_all="$WORK/gitleaks-allow-all.toml"
+gitleaks_allow_all_toml >"$gitleaks_allow_all"
+
 secret=$(new_secret)
 secret_repo=$(new_repo)
 commit_file "$secret_repo" app.env "API_TOKEN=$secret" >/dev/null
@@ -365,17 +453,46 @@ expect osv-version-mismatch-red 1 "version mismatch: osv-scanner" -- \
 	run_floor_script "$(floor_copy_with 'OSV_VERSION="2.6.0"' 'OSV_VERSION="2.5.9"')" "$osv_repo" osv
 # shellcheck disable=SC2016 # literal stub/source text
 expect non-x86_64-red 1 "unsupported platform: Linux aarch64" -- \
-	run_floor "$clean_repo" gitleaks \
-	PATH="$(stub_dir 'uname=case "$1" in -m) echo aarch64 ;; *) echo Linux ;; esac')":"$PATH"
+	run_floor_script "$(floor_with_stubs_on_path 'uname=case "$1" in -m) echo aarch64 ;; *) echo Linux ;; esac')" \
+	"$clean_repo" gitleaks
 # shellcheck disable=SC2016 # literal stub/source text
 expect non-linux-red 1 "unsupported platform: Darwin x86_64" -- \
-	run_floor "$clean_repo" osv \
-	PATH="$(stub_dir 'uname=case "$1" in -m) echo x86_64 ;; *) echo Darwin ;; esac')":"$PATH"
+	run_floor_script "$(floor_with_stubs_on_path 'uname=case "$1" in -m) echo x86_64 ;; *) echo Darwin ;; esac')" \
+	"$osv_repo" osv
+expect gitleaks-extract-failure-red 1 "FAIL: extract failed: gitleaks" -- \
+	run_floor_script "$(floor_with_stubs_on_path 'tar=exit 2')" "$clean_repo" gitleaks
+expect cache-dir-symlink-red 1 "FAIL: unsafe cache directory" -- \
+	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(runner_temp_with_symlink security-floor)"
+expect cache-bin-symlink-red 1 "FAIL: unsafe cache directory" -- \
+	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(runner_temp_with_symlink security-floor/bin)"
 
-# Tools run only by absolute path; output is redacted.
+# The caller's PATH and gitleaks config variables are ignored.
+expect env-path-tar-shim-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks RUNNER_TEMP="$(fresh_runner_temp)" PATH="$(tar_shim_dir):$PATH"
+expect env-gitleaks-config-toml-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks GITLEAKS_CONFIG_TOML="$(<"$gitleaks_allow_all")"
+expect env-gitleaks-config-file-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks GITLEAKS_CONFIG="$gitleaks_allow_all"
+expect env-attack-clean-repo-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(fresh_runner_temp)" PATH="$(tar_shim_dir):$PATH" \
+	GITLEAKS_CONFIG_TOML="$(<"$gitleaks_allow_all")" GITLEAKS_CONFIG="$gitleaks_allow_all"
+
+# An osv-scanner.toml in the scanned tree cannot ignore advisories.
+expect osv-vulnerable-lockfile-red 1 "FAIL: osv: scan failed" -- \
+	run_floor "$osv_vuln_repo" osv
+expect osv-repo-ignore-toml-still-red 1 "FAIL: osv: scan failed" -- \
+	run_floor "$osv_vuln_ignore_repo" osv
+expect osv-clean-lockfile-with-toml-green 0 "PASS: osv: no known vulnerabilities" -- \
+	run_floor "$osv_clean_ignore_repo" osv
+
+# Tools run only by absolute path, even when a trusted PATH entry holds a
+# same-named binary; output is redacted.
 expect gitleaks-path-shadow-secret-red 1 "FAIL: gitleaks: leaks found" -- \
-	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$push_event" \
-	PATH="$(stub_dir 'gitleaks=exit 0' 'osv-scanner=exit 0')":"$PATH"
+	run_floor_script "$(floor_with_stubs_on_path 'gitleaks=exit 0' 'osv-scanner=exit 0')" \
+	"$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$push_event"
+expect osv-path-shadow-vulnerable-red 1 "FAIL: osv: scan failed" -- \
+	run_floor_script "$(floor_with_stubs_on_path 'gitleaks=exit 0' 'osv-scanner=exit 0')" \
+	"$osv_vuln_repo" osv
 expect gitleaks-secret-redacted 1 "github-pat" --absent "$secret" -- \
 	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$push_event"
 
