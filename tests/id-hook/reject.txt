@@ -1,0 +1,23 @@
+alpha-widgets.f3.07
+see widget.f12.1 for details
+gizmo9.f1.10
+demo-plan-2023-04-05.01
+sample-2020-12-31.3
+per DEC-7
+DEC-42
+closed by DEC-987.
+Doppler
+token from Bitwarden
+self-hosted Vaultwarden
+stored in 1Password
+LastPass entry
+Dashlane
+KeePass database
+KeePassXC database
+read it from Vault
+Infisical project
+Akeyless
+CyberArk safe
+Passbolt
+AWS Secrets Manager
+Google Secret Manager

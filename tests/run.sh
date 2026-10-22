@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Self-test for actions/security-floor (floor.sh, action.yml). Needs network
-# access, git, curl, jq, yq and sha256sum. Every fixture is generated at
-# runtime.
+# Self-test for actions/security-floor (floor.sh, action.yml) and the
+# pre-commit config. Needs network access, git, curl, jq, yq, pre-commit and
+# sha256sum. Every fixture is generated at runtime, except the id-hook line
+# lists under tests/id-hook/.
 #
 # Row contract: expect <name> <exit> <grep-text> [--contains <text>]
 #                      [--absent <text>] -- cmd...
@@ -22,6 +23,10 @@ readonly ROOT
 readonly FLOOR_SH="$ROOT/actions/security-floor/floor.sh"
 readonly ACTION_YML="$ROOT/actions/security-floor/action.yml"
 readonly SELF="$ROOT/tests/run.sh"
+readonly PRECOMMIT_CONFIG="$ROOT/.pre-commit-config.yaml"
+readonly ID_HOOK="no-internal-ids"
+readonly ID_HOOK_ACCEPT="$ROOT/tests/id-hook/accept.txt"
+readonly ID_HOOK_REJECT="$ROOT/tests/id-hook/reject.txt"
 
 WORK=$(mktemp -d)
 readonly WORK
@@ -815,6 +820,78 @@ imported_chmod_drops_fake_gitleaks() {
 		/bin/bash -c 'chmod 0700 "$1" && "$1" version' bash "$target"
 }
 
+# ---------------------------------------------------------------- pre-commit
+
+# id_hook_config <config> <out>: only the id hook, with its exclude dropped so
+# fixture files are checked wherever they sit.
+id_hook_config() {
+	HOOK_ID="$ID_HOOK" yq '
+		.repos = [.repos[] | select(.repo == "local")
+			| .hooks = [.hooks[] | select(.id == strenv(HOOK_ID)) | del(.exclude)]
+			| select(.hooks | length == 1)]' "$1" >"$2"
+	[[ "$(yq '.repos | length' "$2")" == 1 ]] || {
+		echo "id_hook_config: no local hook $ID_HOOK in $1" >&2
+		return 1
+	}
+}
+
+# id_hook_run <config> <out>: writes each accept line to accept-<n>.txt and
+# each reject line to reject-<n>.txt in a fresh repo, runs the derived hook
+# once over all of them, and saves its output.
+id_hook_run() {
+	local config=$1 out=$2 repo kind n line
+	local -a files=()
+	repo=$(new_repo)
+	id_hook_config "$config" "$repo/hook.yaml"
+	for kind in accept reject; do
+		n=0
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			n=$((n + 1))
+			printf '%s\n' "$line" >"$repo/$kind-$n.txt"
+			files+=("$kind-$n.txt")
+		done <"$ROOT/tests/id-hook/$kind.txt"
+	done
+	git -C "$repo" add -- hook.yaml "${files[@]}"
+	(cd -- "$repo" && PRE_COMMIT_HOME="$WORK/pre-commit-home" \
+		pre-commit run "$ID_HOOK" -c hook.yaml --color never --files "${files[@]}") >"$out" 2>&1 || true
+}
+
+# id_hook_verdict <output> <file> <reported|quiet>: the hook ran, and named
+# the file or not.
+id_hook_verdict() {
+	local out=$1 file=$2 want=$3 got=quiet
+	grep -q '^no internal ids or secrets-store names\.\.\.*\(Passed\|Failed\)$' "$out" || {
+		echo "id hook did not run:"
+		cat -- "$out"
+		return 2
+	}
+	cut -d: -f1 -- "$out" | grep -qxF -- "$file" && got=reported
+	echo "$file: $got"
+	[[ "$got" == "$want" ]]
+}
+
+# fixture_lines <file>: the line count, failing on an empty list.
+fixture_lines() {
+	local n
+	n=$(grep -c '' "$1" || true)
+	echo "$1: $n lines"
+	[[ "$n" -gt 0 ]]
+}
+
+# check_gitleaks_rev_parity <config> <floor.sh>: the hook rev, without its
+# leading v, is the version floor.sh pins.
+check_gitleaks_rev_parity() {
+	local rev pin
+	rev=$(yq '.repos[] | select(.repo == "https://github.com/gitleaks/gitleaks") | .rev' "$1")
+	pin=$(sed -n 's/^readonly GITLEAKS_VERSION="\([^"]*\)"$/\1/p' "$2")
+	if [[ -n "$pin" && "${rev#v}" == "$pin" ]]; then
+		echo "gitleaks rev parity: $pin"
+	else
+		echo "gitleaks rev mismatch: hook '$rev', floor.sh '$pin'"
+		return 1
+	fi
+}
+
 # ---------------------------------------------------------------- rows
 
 gitleaks_sha=$(sed -n 's/^readonly GITLEAKS_SHA256="\([0-9a-f]*\)"$/\1/p' "$FLOOR_SH")
@@ -1262,5 +1339,31 @@ expect source-pins-literal 0 "pins are literal" -- check_pins_literal "$FLOOR_SH
 # shellcheck disable=SC2016 # literal stub/source text
 expect source-pins-check-catches-env-default 1 "default expansion" -- \
 	check_pins_literal "$(floor_copy_with 'GITLEAKS_VERSION="8.30.1"' 'GITLEAKS_VERSION="${GITLEAKS_VERSION:-8.30.1}"')"
+
+# Pre-commit: the id hook over every fixture line, one row per line. The
+# fixture-size rows fail the run when a list is empty.
+expect id-hook-accept-fixture-nonempty 0 "lines" -- fixture_lines "$ID_HOOK_ACCEPT"
+expect id-hook-reject-fixture-nonempty 0 "lines" -- fixture_lines "$ID_HOOK_REJECT"
+id_hook_out="$WORK/id-hook.out"
+id_hook_run "$PRECOMMIT_CONFIG" "$id_hook_out"
+accept_lines=$(grep -c '' "$ID_HOOK_ACCEPT" || true)
+reject_lines=$(grep -c '' "$ID_HOOK_REJECT" || true)
+for kind in accept reject; do
+	if [[ "$kind" == accept ]]; then
+		count=$accept_lines verdict=quiet
+	else
+		count=$reject_lines verdict=reported
+	fi
+	for ((n = 1; n <= count; n++)); do
+		expect "id-hook-$kind-line-$n" 0 "$kind-$n.txt: $verdict" -- \
+			id_hook_verdict "$id_hook_out" "$kind-$n.txt" "$verdict"
+	done
+done
+declare_dynamic_rows "$((accept_lines + reject_lines - 1))"
+
+expect precommit-gitleaks-rev-parity 0 "gitleaks rev parity: 8.30.1" -- \
+	check_gitleaks_rev_parity "$PRECOMMIT_CONFIG" "$FLOOR_SH"
+expect precommit-gitleaks-rev-parity-catches-drift 1 "gitleaks rev mismatch" -- \
+	check_gitleaks_rev_parity "$(copy_with "$PRECOMMIT_CONFIG" 'rev: v8.30.1' 'rev: v8.30.0')" "$FLOOR_SH"
 
 reconcile
