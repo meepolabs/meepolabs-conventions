@@ -6,10 +6,12 @@
 #   Runs cmd, asserts its exit code AND that its combined output contains
 #   <grep-text> (fixed string). --absent fails the row if <text> appears.
 #
-# Reconciliation: the run passes only if the emitted PASS lines equal the
-# number of `expect` call sites in this file (lines starting with `expect`)
-# plus rows declared with declare_dynamic_rows. A call site inside a loop
-# counts once; the loop declares its extra iterations explicitly.
+# Reconciliation: the run passes only if the emitted PASS plus SKIP lines
+# equal the number of `expect` call sites in this file (lines starting with
+# `expect`) plus rows declared with declare_dynamic_rows. A call site inside a
+# loop counts once; the loop declares its extra iterations explicitly. A row
+# that cannot run in this environment calls skip_row in place of its expect,
+# and the skip is printed in the final count line.
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -24,9 +26,11 @@ readonly SHARED_RUNNER_TEMP="$WORK/runner-temp-shared"
 readonly FAKE_HOME="$WORK/home"
 readonly PASS_LOG="$WORK/pass.log"
 readonly FAIL_LOG="$WORK/fail.log"
+readonly SKIP_LOG="$WORK/skip.log"
 mkdir -p -- "$SHARED_RUNNER_TEMP" "$FAKE_HOME"
 : >"$PASS_LOG"
 : >"$FAIL_LOG"
+: >"$SKIP_LOG"
 DYNAMIC_ROWS=0
 ROW_SEQ=0
 
@@ -79,20 +83,26 @@ expect() {
 	fi
 }
 
+# skip_row <name> <reason>: stands in for exactly one expect call site.
+skip_row() {
+	printf 'SKIP %s: %s\n' "$1" "$2" | tee -a "$SKIP_LOG"
+}
+
 declare_dynamic_rows() {
 	DYNAMIC_ROWS=$((DYNAMIC_ROWS + $1))
 }
 
 reconcile() {
-	local call_sites emitted failed expected
+	local call_sites emitted failed skipped expected
 	# Counts misspelled calls too (expect_row ...), so a row that silently
 	# stops running still raises the expected total.
 	call_sites=$(grep -cE '^[[:space:]]*expect[A-Za-z0-9_-]*[[:space:]]' "$SELF")
 	emitted=$(grep -c '^PASS ' "$PASS_LOG" || true)
 	failed=$(grep -c '^FAIL ' "$FAIL_LOG" || true)
+	skipped=$(grep -c '^SKIP ' "$SKIP_LOG" || true)
 	expected=$((call_sites + DYNAMIC_ROWS))
-	echo "rows: PASS $emitted, FAIL $failed, expected PASS $expected ($call_sites call sites + $DYNAMIC_ROWS dynamic)"
-	if [[ "$failed" -ne 0 || "$emitted" -ne "$expected" ]]; then
+	echo "rows: PASS $emitted, SKIP $skipped, FAIL $failed, expected PASS+SKIP $expected ($call_sites call sites + $DYNAMIC_ROWS dynamic)"
+	if [[ "$failed" -ne 0 || "$((emitted + skipped))" -ne "$expected" ]]; then
 		echo "self-test: FAILED"
 		return 1
 	fi
@@ -230,7 +240,59 @@ floor_copy_with() {
 floor_with_stubs_on_path() {
 	local dir
 	dir=$(stub_dir "$@")
-	floor_copy_with 'export PATH=/usr/bin:/bin' "export PATH=$dir:/usr/bin:/bin"
+	floor_copy_with 'readonly FLOOR_PATH=/usr/bin:/bin' "readonly FLOOR_PATH=$dir:/usr/bin:/bin"
+}
+
+# tar_to_command_script: a TAR_OPTIONS --to-command target that, in place of
+# extracting, writes a gitleaks that reports the pinned version and finds
+# nothing next to the archive.
+tar_to_command_script() {
+	local file
+	file=$(mktemp "$WORK/to-command.XXXXXX")
+	cat >"$file" <<'EOF'
+#!/bin/sh
+cat >/dev/null
+dest=$(dirname "$TAR_ARCHIVE")/$TAR_FILENAME
+printf '#!/bin/sh\n[ "$1" = version ] && echo 8.30.1\nexit 0\n' >"$dest"
+chmod 0700 "$dest"
+EOF
+	chmod 0755 "$file"
+	printf '%s\n' "$file"
+}
+
+# run_floor_with_absent_preload <repo> <subcommand> [NAME=VALUE...]
+# Runs floor.sh with LD_PRELOAD naming a missing library, so the dynamic
+# loader reports every process that inherited it. A calibration run (no
+# subcommand, which exits before starting any child) counts the processes
+# that necessarily start before the environment is rebuilt; the real run
+# must report no more. Returns the floor's exit code, or 3 if any child
+# inherited LD_PRELOAD.
+run_floor_with_absent_preload() {
+	local repo=$1 sub=$2 lib="$WORK/absent-preload.so" log baseline reached rc=0
+	shift 2
+	log=$(mktemp "$WORK/preload.XXXXXX")
+	baseline=$( (cd -- "$repo" && env -i PATH="$PATH" LD_PRELOAD="$lib" "$FLOOR_SH") 2>&1 | grep -cF -- "$lib" || true)
+	run_floor "$repo" "$sub" LD_PRELOAD="$lib" "$@" >"$log" 2>&1 || rc=$?
+	cat -- "$log"
+	reached=$(grep -cF -- "$lib" "$log" || true)
+	if [[ "$reached" -gt "$baseline" ]]; then
+		echo "LD_PRELOAD reached $((reached - baseline)) processes after sanitization"
+		return 3
+	fi
+	return "$rc"
+}
+
+# run_floor_sentinel_preset <script> <repo> <subcommand> [NAME=VALUE...]
+# Starts floor.sh the way the re-exec does (bash -p, fixed PATH, LC_ALL=C)
+# with the sentinel already set to the PID the script will see, so the
+# re-exec is skipped and only the in-script environment check stands.
+run_floor_sentinel_preset() {
+	local script=$1 repo=$2 sub=$3
+	shift 3
+	cd -- "$repo"
+	# shellcheck disable=SC2016 # $$ expands in the child shell
+	env -i PATH=/usr/bin:/bin LC_ALL=C HOME="$FAKE_HOME" RUNNER_TEMP="$SHARED_RUNNER_TEMP" "$@" \
+		/bin/bash -c 'SECURITY_FLOOR_REEXEC_PID=$$ exec /bin/bash -p -- "$0" "$1"' "$script" "$sub"
 }
 
 # tar_shim_dir: a `tar` that ignores the archive and writes, into the -C
@@ -414,6 +476,11 @@ commit_file "$secret_repo" app.env "API_TOKEN=$secret" >/dev/null
 secret_head=$(git -C "$secret_repo" rev-parse HEAD)
 write_event_push "$push_event" "$clean_head" "$secret_head"
 
+tar_to_command=$(tar_to_command_script)
+no_diff_attributes="$WORK/no-diff.attributes"
+printf '* -diff\n' >"$no_diff_attributes"
+git_config_no_diff=(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.attributesFile GIT_CONFIG_VALUE_0="$no_diff_attributes")
+
 port=$(closed_port)
 proxy="http://127.0.0.1:$port"
 
@@ -465,17 +532,46 @@ expect cache-dir-symlink-red 1 "FAIL: unsafe cache directory" -- \
 	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(runner_temp_with_symlink security-floor)"
 expect cache-bin-symlink-red 1 "FAIL: unsafe cache directory" -- \
 	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(runner_temp_with_symlink security-floor/bin)"
+# A cache directory owned by another user is refused before chmod is tried.
+# As root -O always holds, and the copy would chmod /usr/bin.
+if [[ "$EUID" -eq 0 ]]; then
+	skip_row cache-dir-foreign-owner-red "running as root: ownership cannot differ"
+else
+	# shellcheck disable=SC2016 # literal source text
+	expect cache-dir-foreign-owner-red 1 "FAIL: unsafe cache directory: /usr" -- \
+		run_floor_script "$(floor_copy_with 'local floor_dir="$BASE_DIR/security-floor"' 'local floor_dir="$BASE_DIR"')" \
+		"$clean_repo" gitleaks RUNNER_TEMP=/usr
+fi
 
-# The caller's PATH and gitleaks config variables are ignored.
+# The caller's environment is replaced by an allowlist: none of these reach
+# tar, git, gitleaks or the loader.
 expect env-path-tar-shim-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$secret_repo" gitleaks RUNNER_TEMP="$(fresh_runner_temp)" PATH="$(tar_shim_dir):$PATH"
 expect env-gitleaks-config-toml-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$secret_repo" gitleaks GITLEAKS_CONFIG_TOML="$(<"$gitleaks_allow_all")"
 expect env-gitleaks-config-file-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$secret_repo" gitleaks GITLEAKS_CONFIG="$gitleaks_allow_all"
+expect env-tar-options-to-command-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks TAR_OPTIONS="--to-command=$tar_to_command"
+expect env-ld-preload-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor_with_absent_preload "$secret_repo" gitleaks
+expect env-git-dir-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks GIT_DIR="$clean_repo/.git"
+expect env-git-config-attributes-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks "${git_config_no_diff[@]}"
+expect env-sentinel-wrong-pid-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks SECURITY_FLOOR_REEXEC_PID=1 TAR_OPTIONS="--to-command=$tar_to_command"
+expect env-sentinel-preset-secret-red 1 "FAIL: unsanitized environment: unexpected variable TAR_OPTIONS" -- \
+	run_floor_sentinel_preset "$FLOOR_SH" "$secret_repo" gitleaks TAR_OPTIONS="--to-command=$tar_to_command"
+expect env-sentinel-preset-hidden-name-red 1 "FAIL: unsanitized environment: unexpected variable BASH_FUNC_floor%%" -- \
+	run_floor_sentinel_preset "$FLOOR_SH" "$clean_repo" gitleaks 'BASH_FUNC_floor%%=() { :; }'
+expect env-sentinel-preset-clean-env-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor_sentinel_preset "$FLOOR_SH" "$clean_repo" gitleaks
 expect env-attack-clean-repo-green 0 "PASS: gitleaks: no leaks found" -- \
-	run_floor "$clean_repo" gitleaks RUNNER_TEMP="$(fresh_runner_temp)" PATH="$(tar_shim_dir):$PATH" \
-	GITLEAKS_CONFIG_TOML="$(<"$gitleaks_allow_all")" GITLEAKS_CONFIG="$gitleaks_allow_all"
+	run_floor_with_absent_preload "$clean_repo" gitleaks RUNNER_TEMP="$(fresh_runner_temp)" PATH="$(tar_shim_dir):$PATH" \
+	GITLEAKS_CONFIG_TOML="$(<"$gitleaks_allow_all")" GITLEAKS_CONFIG="$gitleaks_allow_all" \
+	TAR_OPTIONS="--to-command=$tar_to_command" GIT_DIR="$clean_repo/.git" "${git_config_no_diff[@]}" \
+	SECURITY_FLOOR_REEXEC_PID=1
 
 # An osv-scanner.toml in the scanned tree cannot ignore advisories.
 expect osv-vulnerable-lockfile-red 1 "FAIL: osv: scan failed" -- \

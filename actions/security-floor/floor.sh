@@ -5,12 +5,62 @@
 # Usage: floor.sh gitleaks|osv
 # Exit:  0 pass, 1 any failure, 2 usage error.
 set -euo pipefail
-umask 077
 
-# Narrows, does not close, what an earlier step in the same job can inject:
-# a shadowing tool on PATH or a gitleaks config that allowlists everything.
-export PATH=/usr/bin:/bin
-unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+# An earlier step in the job can export variables that change which bytes run
+# or what they scan (TAR_OPTIONS, LD_PRELOAD, GIT_DIR, GIT_CONFIG_*, tool
+# config, PATH, ...). No denylist of them stays complete, so the script
+# re-executes itself once in an environment built only from this allowlist.
+# The sentinel carries this process's PID, which exec preserves. It only
+# prevents a re-exec loop: a run that finds it set must still pass the check
+# below, so a caller presetting it gains nothing.
+readonly FLOOR_PATH=/usr/bin:/bin
+if [[ "${SECURITY_FLOOR_REEXEC_PID:-}" != "$$" ]]; then
+	floor_env=(PATH="$FLOOR_PATH" LC_ALL=C SECURITY_FLOOR_REEXEC_PID="$$")
+	# git reads its global config (safe.directory on runners) from HOME.
+	[[ -v HOME ]] && floor_env+=("HOME=$HOME")
+	# Cache and work directory root; TMPDIR is the fallback when it is unset.
+	[[ -v RUNNER_TEMP ]] && floor_env+=("RUNNER_TEMP=$RUNNER_TEMP")
+	[[ -v TMPDIR ]] && floor_env+=("TMPDIR=$TMPDIR")
+	# Runner-written event context and job summary paths: data, not code.
+	[[ -v GITHUB_EVENT_NAME ]] && floor_env+=("GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME")
+	[[ -v GITHUB_EVENT_PATH ]] && floor_env+=("GITHUB_EVENT_PATH=$GITHUB_EVENT_PATH")
+	[[ -v GITHUB_STEP_SUMMARY ]] && floor_env+=("GITHUB_STEP_SUMMARY=$GITHUB_STEP_SUMMARY")
+	# Egress proxies on self-hosted runners, honored by curl and osv-scanner.
+	# A proxy only carries bytes; the hash check decides what runs.
+	[[ -v https_proxy ]] && floor_env+=("https_proxy=$https_proxy")
+	[[ -v HTTPS_PROXY ]] && floor_env+=("HTTPS_PROXY=$HTTPS_PROXY")
+	[[ -v no_proxy ]] && floor_env+=("no_proxy=$no_proxy")
+	[[ -v NO_PROXY ]] && floor_env+=("NO_PROXY=$NO_PROXY")
+	# -p: the new shell ignores BASH_ENV and imported functions.
+	exec /usr/bin/env -i "${floor_env[@]}" /bin/bash -p -- "$0" "$@"
+fi
+
+# Reached directly (sentinel preset) or after the re-exec: either way the
+# environment must look exactly like the re-exec builds it. The process's
+# initial environment is read from the kernel, not from `compgen -e`: bash
+# hides entries whose names it cannot hold (BASH_FUNC_x%%, A-B) but still
+# passes them on to every child.
+assert_sanitized_env() {
+	local entry name
+	[[ $- == *p* && "$PATH" == "$FLOOR_PATH" && "${LC_ALL:-}" == C ]] ||
+		{ printf 'security-floor: FAIL: unsanitized environment: shell flags, PATH or LC_ALL\n' >&2; exit 1; }
+	[[ -r /proc/$$/environ ]] ||
+		{ printf 'security-floor: FAIL: unsanitized environment: cannot read /proc/%s/environ\n' "$$" >&2; exit 1; }
+	while IFS= read -r -d '' entry; do
+		name=${entry%%=*}
+		case "$name" in
+		PATH | LC_ALL | SECURITY_FLOOR_REEXEC_PID | PWD | OLDPWD | SHLVL | _) ;;
+		HOME | RUNNER_TEMP | TMPDIR | GITHUB_EVENT_NAME | GITHUB_EVENT_PATH | GITHUB_STEP_SUMMARY) ;;
+		https_proxy | HTTPS_PROXY | no_proxy | NO_PROXY) ;;
+		*)
+			printf 'security-floor: FAIL: unsanitized environment: unexpected variable %s\n' "$name" >&2
+			exit 1
+			;;
+		esac
+	done <"/proc/$$/environ"
+}
+assert_sanitized_env
+umask 077
 
 # Tool pins. Literals only: a version, URL or hash read from the environment
 # would be a bypass that leaves no diff (tests/run.sh enforces this).
