@@ -1363,7 +1363,7 @@ declare_dynamic_rows "$((accept_lines + reject_lines - 1))"
 
 expect precommit-gitleaks-rev-parity 0 "gitleaks rev parity: 8.30.1" -- \
 	check_gitleaks_rev_parity "$PRECOMMIT_CONFIG" "$FLOOR_SH"
-expect precommit-gitleaks-rev-parity-catches-drift 1 "gitleaks rev mismatch" -- \
+expect precommit-gitleaks-rev-parity-catches-drift 1 "gitleaks rev mismatch: hook 'v8.30.0', floor.sh '8.30.1'" -- \
 	check_gitleaks_rev_parity "$(copy_with "$PRECOMMIT_CONFIG" 'rev: v8.30.1' 'rev: v8.30.0')" "$FLOOR_SH"
 
 reconcile
