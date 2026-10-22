@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Self-test for actions/security-floor/floor.sh. Needs network access, git,
-# curl, jq and sha256sum. Every fixture is generated at runtime.
+# Self-test for actions/security-floor (floor.sh, action.yml). Needs network
+# access, git, curl, jq, yq and sha256sum. Every fixture is generated at
+# runtime.
 #
 # Row contract: expect <name> <exit> <grep-text> [--contains <text>]
 #                      [--absent <text>] -- cmd...
@@ -19,6 +20,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT
 readonly FLOOR_SH="$ROOT/actions/security-floor/floor.sh"
+readonly ACTION_YML="$ROOT/actions/security-floor/action.yml"
 readonly SELF="$ROOT/tests/run.sh"
 
 WORK=$(mktemp -d)
@@ -485,7 +487,7 @@ EOF
 # copy_with <file> <from> <to>: a temp copy of <file> with one literal
 # replaced; fails if <from> is not present exactly once.
 copy_with() {
-	local file=$1 from=$2 to=$3 dir content n
+	local file=$1 from=$2 to=$3 dir content n copy
 	content=$(<"$file")
 	n=$(grep -cF -- "$from" "$file" || true)
 	[[ "$n" == 1 ]] || {
@@ -493,9 +495,10 @@ copy_with() {
 		return 1
 	}
 	dir=$(mktemp -d "$WORK/floor-copy.XXXXXX")
-	printf '%s\n' "${content/"$from"/"$to"}" >"$dir/floor.sh"
-	chmod 0755 "$dir/floor.sh"
-	printf '%s\n' "$dir/floor.sh"
+	copy="$dir/$(basename -- "$file")"
+	printf '%s\n' "${content/"$from"/"$to"}" >"$copy"
+	chmod 0755 "$copy"
+	printf '%s\n' "$copy"
 }
 
 floor_copy_with() {
@@ -705,6 +708,111 @@ check_pins_literal() {
 	done < <(grep -oE '[A-Z][A-Z0-9_]*_(VERSION|URL|SHA256)' "$file" | sort -u)
 	[[ "$bad" == 0 ]] || return 1
 	echo "pins are literal"
+}
+
+# action_json <file>: action.yml as JSON, so the checks below query it with jq.
+action_json() {
+	yq -o=json '.' "$1"
+}
+
+# check_action_interface <file>: no inputs and no outputs, not even empty.
+check_action_interface() {
+	local declared
+	declared=$(action_json "$1" | jq -r '[keys[] | select(. == "inputs" or . == "outputs")] | join(" ")')
+	[[ -z "$declared" ]] || {
+		echo "action declares: $declared"
+		return 1
+	}
+	echo "no inputs or outputs"
+}
+
+# check_action_run_lines <file>: a composite action whose only steps are the
+# gitleaks and osv runs of floor.sh, in that order, each in bash.
+check_action_run_lines() {
+	local got want
+	got=$(action_json "$1" | jq -c '{using: .runs.using, steps: [.runs.steps[] | {id, shell, run}]}')
+	# shellcheck disable=SC2016 # the action's run text, expanded by the runner
+	want=$(jq -cn --arg p '/bin/bash -p "$GITHUB_ACTION_PATH/floor.sh"' \
+		'{using: "composite", steps: [
+			{id: "gitleaks", shell: "bash", run: ($p + " gitleaks")},
+			{id: "osv", shell: "bash", run: ($p + " osv")}]}')
+	[[ "$got" == "$want" ]] || {
+		printf 'unexpected run lines:\n got %s\nwant %s\n' "$got" "$want"
+		return 1
+	}
+	echo "two run lines: gitleaks, osv"
+}
+
+# check_action_privileged_bash <file>: every run starts the script with
+# /bin/bash -p, so BASH_ENV and exported functions are not loaded.
+check_action_privileged_bash() {
+	local bad
+	bad=$(action_json "$1" | jq -r '.runs.steps[] | select(.run | startswith("/bin/bash -p ") | not) | .id')
+	[[ -z "$bad" ]] || {
+		echo "run without /bin/bash -p in step: $bad"
+		return 1
+	}
+	echo "every run uses /bin/bash -p"
+}
+
+# check_action_osv_condition <file>: osv runs after a gitleaks failure.
+check_action_osv_condition() {
+	local cond
+	cond=$(action_json "$1" | jq -r '.runs.steps[] | select(.id == "osv") | .["if"] // ""')
+	# shellcheck disable=SC2016 # literal expression text
+	[[ "$cond" == '${{ !cancelled() }}' ]] || {
+		echo "osv step condition is '$cond'"
+		return 1
+	}
+	echo "osv runs unless cancelled"
+}
+
+# check_action_no_run_expressions <file>: no workflow expression is spliced
+# into shell text.
+check_action_no_run_expressions() {
+	local bad
+	bad=$(action_json "$1" | jq -r '.runs.steps[] | select(.run | contains("${{")) | .id')
+	[[ -z "$bad" ]] || {
+		echo "expression in run of step: $bad"
+		return 1
+	}
+	echo "no expressions in run"
+}
+
+# run_action_step <action.yml> <step id> <repo> [NAME=VALUE...]: runs the
+# step's run text the way a composite bash step does (a script file under
+# bash --noprofile --norc -eo pipefail) with GITHUB_ACTION_PATH at the real
+# action directory and the repo as working directory.
+run_action_step() {
+	local action=$1 id=$2 repo=$3 script
+	shift 3
+	script=$(mktemp "$WORK/step.XXXXXX")
+	action_json "$action" | jq -r --arg id "$id" '.runs.steps[] | select(.id == $id) | .run' >"$script"
+	[[ -s "$script" ]] || {
+		echo "run_action_step: no step $id"
+		return 2
+	}
+	cd -- "$repo"
+	env -i PATH="$PATH" HOME="$FAKE_HOME" RUNNER_TEMP="$SHARED_RUNNER_TEMP" \
+		GITHUB_ACTION_PATH="$(dirname -- "$FLOOR_SH")" "$@" \
+		/bin/bash --noprofile --norc -eo pipefail "$script"
+}
+
+# A bash function body for chmod that, when bash imports it, replaces any
+# gitleaks it is asked to chmod with a stub that reports the pinned version
+# and finds nothing.
+# shellcheck disable=SC2016 # function source text
+readonly CHMOD_DROPS_FAKE_GITLEAKS='() { case "$2" in */gitleaks) printf "#!/bin/sh\n[ \"\$1\" = version ] && echo 8.30.1\nexit 0\n" >"$2" ;; esac; command chmod "$@"; }'
+
+# imported_chmod_drops_fake_gitleaks: plain bash imports the function, and
+# a chmod of a gitleaks path leaves the stub behind.
+imported_chmod_drops_fake_gitleaks() {
+	local target
+	target="$(mktemp -d "$WORK/fake-gitleaks.XXXXXX")/gitleaks"
+	: >"$target"
+	# shellcheck disable=SC2016 # expands in the child shell
+	env -i PATH=/usr/bin:/bin "BASH_FUNC_chmod%%=$CHMOD_DROPS_FAKE_GITLEAKS" \
+		/bin/bash -c 'chmod 0700 "$1" && "$1" version' bash "$target"
 }
 
 # ---------------------------------------------------------------- rows
@@ -1103,6 +1211,51 @@ expect foreign-owner-workspace-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 expect foreign-owner-untrusted-path-red 1 "FAIL: not a usable git checkout" -- \
 	run_floor_script "$(floor_copy_with '"GIT_CONFIG_VALUE_0=$workspace"' \
 		'GIT_TEST_ASSUME_DIFFERENT_OWNER=1 "GIT_CONFIG_VALUE_0=$workspace/elsewhere"')" "$secret_repo" gitleaks
+
+# action.yml: the composite wiring, read through yq. Each check has a
+# control on a copy with one literal changed.
+expect source-action-no-inputs-outputs 0 "no inputs or outputs" -- check_action_interface "$ACTION_YML"
+expect source-action-inputs-check-catches-input 1 "action declares: inputs" -- \
+	check_action_interface "$(copy_with "$ACTION_YML" 'runs:' $'inputs: {x: {description: x}}\nruns:')"
+expect source-action-outputs-check-catches-output 1 "action declares: outputs" -- \
+	check_action_interface "$(copy_with "$ACTION_YML" 'runs:' $'outputs: {x: {description: x, value: x}}\nruns:')"
+expect source-action-run-lines 0 "two run lines: gitleaks, osv" -- check_action_run_lines "$ACTION_YML"
+expect source-action-run-lines-check-catches-subcommand 1 "unexpected run lines" -- \
+	check_action_run_lines "$(copy_with "$ACTION_YML" 'floor.sh" osv' 'floor.sh" gitleaks')"
+expect source-action-privileged-bash 0 "every run uses /bin/bash -p" -- check_action_privileged_bash "$ACTION_YML"
+# shellcheck disable=SC2016 # literal source text
+expect source-action-privileged-check-catches-plain-bash 1 "run without /bin/bash -p in step: osv" -- \
+	check_action_privileged_bash "$(copy_with "$ACTION_YML" 'run: /bin/bash -p "$GITHUB_ACTION_PATH/floor.sh" osv' \
+		'run: /bin/bash "$GITHUB_ACTION_PATH/floor.sh" osv')"
+expect source-action-osv-not-cancelled 0 "osv runs unless cancelled" -- check_action_osv_condition "$ACTION_YML"
+# shellcheck disable=SC2016 # literal source text
+expect source-action-condition-check-catches-missing-if 1 "osv step condition is ''" -- \
+	check_action_osv_condition "$(copy_with "$ACTION_YML" '      if: ${{ !cancelled() }}' '')"
+expect source-action-no-run-expressions 0 "no expressions in run" -- check_action_no_run_expressions "$ACTION_YML"
+# shellcheck disable=SC2016 # literal source text
+expect source-action-expression-check-catches-github-context 1 "expression in run of step: gitleaks" -- \
+	check_action_no_run_expressions "$(copy_with "$ACTION_YML" '"$GITHUB_ACTION_PATH/floor.sh" gitleaks' \
+		'"${{ github.action_path }}/floor.sh" gitleaks')"
+
+# The action's own run lines, executed from the scanned repo: floor.sh is
+# reached by absolute path under bash -p and re-executes itself from $0.
+expect action-step-gitleaks-clean-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_action_step "$ACTION_YML" gitleaks "$clean_repo"
+expect action-step-gitleaks-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_action_step "$ACTION_YML" gitleaks "$secret_repo"
+expect action-step-osv-clean-green 0 "PASS: osv: no known vulnerabilities" -- \
+	run_action_step "$ACTION_YML" osv "$osv_repo"
+expect action-step-osv-vulnerable-red 1 "FAIL: osv: known vulnerabilities found" -- \
+	run_action_step "$ACTION_YML" osv "$osv_vuln_repo"
+
+# An exported chmod function would swap the verified gitleaks for a stub.
+# The control shows plain bash imports it and the stub then runs. Under the
+# action's bash -p it is never imported; without -p, floor.sh's own re-exec
+# and environment check still reject it, so no green is asserted for that.
+expect bash-func-chmod-fixture-imported-drops-stub 0 "8.30.1" -- imported_chmod_drops_fake_gitleaks
+expect action-step-bash-func-chmod-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_action_step "$ACTION_YML" gitleaks "$secret_repo" RUNNER_TEMP="$(fresh_runner_temp)" \
+	"BASH_FUNC_chmod%%=$CHMOD_DROPS_FAKE_GITLEAKS"
 
 # Source text: pins are literals, never read from the environment.
 expect source-pins-literal 0 "pins are literal" -- check_pins_literal "$FLOOR_SH"

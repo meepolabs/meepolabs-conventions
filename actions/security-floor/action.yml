@@ -1,0 +1,19 @@
+# Callers pin this action by its path, actions/security-floor: the path must
+# never move.
+name: Security floor
+description: >-
+  Secret scan (gitleaks) and dependency scan (osv-scanner) with pinned,
+  checksum-verified tool binaries. Each step fails on a finding or a tool error.
+runs:
+  using: composite
+  steps:
+    # bash -p: the script's shell ignores BASH_ENV and imported functions.
+    - id: gitleaks
+      name: Secret scan (gitleaks)
+      shell: bash
+      run: /bin/bash -p "$GITHUB_ACTION_PATH/floor.sh" gitleaks
+    - id: osv
+      name: Dependency scan (osv-scanner)
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: /bin/bash -p "$GITHUB_ACTION_PATH/floor.sh" osv
