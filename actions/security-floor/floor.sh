@@ -82,6 +82,16 @@ readonly ZERO_SHA="0000000000000000000000000000000000000000"
 readonly GIT_MIN_MAJOR=2
 readonly GIT_MIN_MINOR=36
 
+# Manifest name -> lockfile names that pin it. A manifest is satisfied by a
+# tracked lockfile in its own directory or any parent up to the scan root,
+# which covers Cargo, npm, pnpm, yarn and bun workspaces. Any pyproject.toml
+# counts as a manifest, including one that only configures tools.
+declare -rA MANIFEST_LOCKFILES=(
+	[Cargo.toml]="Cargo.lock"
+	[package.json]="pnpm-lock.yaml package-lock.json yarn.lock bun.lock"
+	[pyproject.toml]="poetry.lock uv.lock"
+)
+
 BASE_DIR=""
 OWNS_BASE_DIR=false
 CACHE_DIR=""
@@ -92,6 +102,9 @@ SCAN_MODE=""
 SCAN_RANGE=""
 SCAN_LOG_OPTS=""
 SCAN_REVS=()
+declare -A TRACKED_LOCKFILES=()
+LOCKFILE_CHECK="not run"
+OSV_SOURCES_FOUND=false
 
 usage() {
 	echo "usage: floor.sh gitleaks|osv" >&2
@@ -373,16 +386,134 @@ run_gitleaks() {
 	esac
 }
 
-# An empty --config replaces any osv-scanner.toml in the scanned tree, so a
-# repo cannot ignore its own advisories.
+# A tracked path as one printable log line: a name holding a newline or other
+# control character is shell-quoted, so it cannot start a workflow command.
+printable_path() {
+	if [[ "$1" =~ [^[:print:]] ]]; then
+		printf '%q' "$1"
+	else
+		printf '%s' "$1"
+	fi
+}
+
+# manifest_has_lockfile <manifest path>: a tracked lockfile for that manifest
+# kind sits in the manifest's directory or one of its parents.
+manifest_has_lockfile() {
+	local manifest=$1 dir="" lock
+	local -a locks
+	read -r -a locks <<<"${MANIFEST_LOCKFILES[${manifest##*/}]}"
+	[[ "$manifest" == */* ]] && dir=${manifest%/*}
+	while true; do
+		for lock in "${locks[@]}"; do
+			[[ -n "${TRACKED_LOCKFILES["${dir:+$dir/}$lock"]:-}" ]] && return 0
+		done
+		[[ -n "$dir" ]] || return 1
+		if [[ "$dir" == */* ]]; then
+			dir=${dir%/*}
+		else
+			dir=""
+		fi
+	done
+}
+
+# The lockfile check reads what git tracks, not the working tree: a lockfile
+# that exists only on the runner proves nothing about the reviewed change.
+# Tracked names are looked up only by plain expansion: `[[ -v map[$key] ]]`
+# would evaluate the subscript a second time.
+check_lockfiles() {
+	local listing="$WORK_DIR/tracked" path name manifest locks lock
+	local -a manifests=() lockless=()
+	local -A lock_names=()
+	for locks in "${MANIFEST_LOCKFILES[@]}"; do
+		for lock in $locks; do
+			lock_names["$lock"]=1
+		done
+	done
+	git_isolated ls-files -z --cached >"$listing" ||
+		osv_fail "not a usable git checkout: cannot list tracked files in $(pwd -P)"
+	while IFS= read -r -d '' path; do
+		name=${path##*/}
+		if [[ -n "${MANIFEST_LOCKFILES["$name"]:-}" ]]; then
+			manifests+=("$path")
+		elif [[ -n "${lock_names["$name"]:-}" ]]; then
+			TRACKED_LOCKFILES["$path"]=1
+		fi
+	done <"$listing"
+	((${#manifests[@]} + ${#TRACKED_LOCKFILES[@]} > 0)) && OSV_SOURCES_FOUND=true
+	if [[ "$OSV_SOURCES_FOUND" != true ]]; then
+		LOCKFILE_CHECK="no manifest or lockfile tracked"
+		info "lockfile check: $LOCKFILE_CHECK"
+		return
+	fi
+	for manifest in "${manifests[@]}"; do
+		manifest_has_lockfile "$manifest" || lockless+=("$manifest")
+	done
+	if ((${#lockless[@]} > 0)); then
+		for manifest in "${lockless[@]}"; do
+			printf 'security-floor: no tracked lockfile for manifest: %s\n' "$(printable_path "$manifest")" >&2
+		done
+		LOCKFILE_CHECK="FAIL, ${#lockless[@]} manifest(s) without a tracked lockfile"
+		osv_fail "lockfile check: ${#lockless[@]} manifest(s) without a tracked lockfile in their directory or a parent"
+	fi
+	LOCKFILE_CHECK="ok"
+	info "lockfile check: ok"
+}
+
+# write_osv_summary <result> [table file]
+write_osv_summary() {
+	local result=$1 table=${2:-}
+	[[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+	{
+		printf '### security-floor: osv\n\n- osv-scanner: %s\n- lockfile check: %s\n- result: %s\n\n' \
+			"$OSV_VERSION" "$LOCKFILE_CHECK" "$result"
+		if [[ -n "$table" && -s "$table" ]]; then
+			cat -- "$table"
+			printf '\n'
+		fi
+	} >>"$GITHUB_STEP_SUMMARY" || info "warning: cannot write the job summary"
+}
+
+osv_fail() {
+	write_osv_summary "FAIL, $*"
+	fail "$@"
+}
+
+# An empty --config replaces every osv-scanner.toml in the scanned tree, so a
+# repo cannot ignore its own advisories. --no-ignore scans tracked files that
+# .gitignore lists. Call analysis is off because it runs only when `go` is
+# installed, and then drops advisories for code it judges uncalled: the
+# verdict would depend on the runner image.
 run_osv() {
-	local rc=0 config="$WORK_DIR/osv-scanner.toml"
+	local rc=0 config="$WORK_DIR/osv-scanner.toml" table="$WORK_DIR/osv-results.md"
+	init_git_env
+	check_lockfiles
 	install_osv
-	: >"$config" || fail "cannot write osv-scanner config"
-	"$WORK_DIR/osv-scanner" scan source --config "$config" -r . || rc=$?
+	: >"$config" || osv_fail "cannot write osv-scanner config"
+	"$WORK_DIR/osv-scanner" scan source --config "$config" --no-ignore --no-call-analysis=all \
+		--format markdown --output-file "$table" -r . || rc=$?
+	[[ -s "$table" ]] && cat -- "$table"
 	case "$rc" in
-	0) pass "osv: no known vulnerabilities" ;;
-	*) fail "osv: scan failed (exit $rc)" ;;
+	0)
+		write_osv_summary "pass, no known vulnerabilities" "$table"
+		pass "osv: no known vulnerabilities"
+		;;
+	1)
+		write_osv_summary "FAIL, known vulnerabilities found" "$table"
+		fail "osv: known vulnerabilities found"
+		;;
+	128)
+		if [[ "$OSV_SOURCES_FOUND" == true ]]; then
+			write_osv_summary "FAIL, lockfile produced no packages"
+			fail "osv: lockfile produced no packages (exit 128)"
+		fi
+		printf '::notice title=security-floor::no package manifest or lockfile found; nothing to scan\n'
+		write_osv_summary "pass (no package sources)"
+		pass "osv: no package sources"
+		;;
+	*)
+		write_osv_summary "FAIL, osv-scanner error (exit $rc)" "$table"
+		fail "osv-scanner error (exit $rc): tool or network failure"
+		;;
 	esac
 }
 

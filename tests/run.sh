@@ -2,9 +2,11 @@
 # Self-test for actions/security-floor/floor.sh. Needs network access, git,
 # curl, jq and sha256sum. Every fixture is generated at runtime.
 #
-# Row contract: expect <name> <exit> <grep-text> [--absent <text>] -- cmd...
+# Row contract: expect <name> <exit> <grep-text> [--contains <text>]
+#                      [--absent <text>] -- cmd...
 #   Runs cmd, asserts its exit code AND that its combined output contains
-#   <grep-text> (fixed string). --absent fails the row if <text> appears.
+#   <grep-text> and every --contains text (fixed strings). --absent fails the
+#   row if <text> appears.
 #
 # Reconciliation: the run passes only if the emitted PASS plus SKIP lines
 # equal the number of `expect` call sites in this file (lines starting with
@@ -40,11 +42,15 @@ ROW_SEQ=0
 expect() {
 	local name=$1 want_exit=$2 want_text=$3
 	shift 3
-	local -a absent=()
+	local -a absent=() contains=()
 	while [[ $# -gt 0 && $1 != "--" ]]; do
 		case "$1" in
 		--absent)
 			absent+=("$2")
+			shift 2
+			;;
+		--contains)
+			contains+=("$2")
 			shift 2
 			;;
 		*)
@@ -68,7 +74,14 @@ expect() {
 	elif ! grep -qF -- "$want_text" "$log"; then
 		reason="output lacks '$want_text'"
 	else
+		for text in "${contains[@]}"; do
+			if ! grep -qF -- "$text" "$log"; then
+				reason="output lacks '$text'"
+				break
+			fi
+		done
 		for text in "${absent[@]}"; do
+			[[ -z "$reason" ]] || break
 			if grep -qF -- "$text" "$log"; then
 				reason="output contains a forbidden string"
 				break
@@ -310,6 +323,101 @@ run_floor_summary() {
 	return "$rc"
 }
 
+# run_floor_summary_only <repo> <subcommand> [NAME=VALUE...]: as
+# run_floor_summary, but the run's own log is discarded, so a match can only
+# come from the summary.
+run_floor_summary_only() {
+	local rc=0
+	run_floor_summary "$@" >"$WORK/summary-only.log" 2>&1 || rc=$?
+	grep '^summary: ' -- "$WORK/summary-only.log" || true
+	return "$rc"
+}
+
+# files_repo <path> <content> [<path> <content>...]: a repo with each file
+# committed in order. Content "" writes a zero-byte file.
+files_repo() {
+	local repo
+	repo=$(new_repo)
+	while [[ $# -gt 0 ]]; do
+		if [[ -z "$2" ]]; then
+			mkdir -p -- "$(dirname -- "$repo/$1")"
+			: >"$repo/$1"
+			git -C "$repo" add -- "$1"
+			git_in "$repo" commit -q -m "add $1"
+		else
+			commit_file "$repo" "$1" "$2" >/dev/null
+		fi
+		shift 2
+	done
+	printf '%s\n' "$repo"
+}
+
+# gitignored_lockfile_repo <ignored: true|false>: a clean root lockfile and a
+# tracked vulnerable sub/package-lock.json, optionally listed in .gitignore.
+gitignored_lockfile_repo() {
+	local repo
+	repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" sub/package-lock.json "$(vulnerable_npm_lockfile)")
+	[[ "$1" == true ]] && commit_file "$repo" .gitignore "sub/" >/dev/null
+	printf '%s\n' "$repo"
+}
+
+# fsmonitor_home: a HOME whose ~/.gitconfig runs a hook, which announces
+# itself on stderr, from any git command that reads the index.
+fsmonitor_home() {
+	local dir
+	dir=$(mktemp -d "$WORK/home.XXXXXX")
+	printf '#!/bin/sh\necho fsmonitor-hook-ran >&2\nexit 1\n' >"$dir/hook"
+	chmod 0755 "$dir/hook"
+	printf '[core]\n\tfsmonitor = %s\n' "$dir/hook" >"$dir/.gitconfig"
+	printf '%s\n' "$dir"
+}
+
+# floor_with_go_stub <marker> [<from> <to>]: a floor.sh copy (optionally with
+# one literal replaced) whose fixed PATH holds a `go` that records each call
+# in <marker>.
+floor_with_go_stub() {
+	local marker=$1 script=$FLOOR_SH dir
+	if [[ $# -ge 3 ]]; then
+		script=$(copy_with "$FLOOR_SH" "$2" "$3")
+	fi
+	dir=$(stub_dir "go=echo \"\$*\" >>'$marker'; exit 1")
+	copy_with "$script" 'readonly FLOOR_PATH=/usr/bin:/bin' "readonly FLOOR_PATH=$dir:/usr/bin:/bin"
+}
+
+# run_floor_reporting_go <marker> <script> <repo>: runs the osv subcommand,
+# then reports whether the go stub was called.
+run_floor_reporting_go() {
+	local marker=$1 rc=0
+	run_floor_script "$2" "$3" osv || rc=$?
+	[[ -s "$marker" ]] && echo "go was invoked: $(head -n 1 -- "$marker")"
+	return "$rc"
+}
+
+# check_osv_flags <file>: the osv-scanner call carries every flag the
+# verdict depends on.
+check_osv_flags() {
+	local file=$1 flag bad=0 call
+	# shellcheck disable=SC2016 # literal source text
+	call=$(grep -F '"$WORK_DIR/osv-scanner" scan source' "$file" || true)
+	[[ -n "$call" ]] || {
+		echo "osv-scanner scan call not found"
+		return 1
+	}
+	# shellcheck disable=SC2016 # literal source text
+	for flag in '--config "$config"' --no-ignore --no-call-analysis=all; do
+		if ! grep -qF -- "$flag" <<<"$call"; then
+			echo "osv-scanner call lacks $flag"
+			bad=1
+		fi
+	done
+	[[ "$bad" == 0 ]] || return 1
+	echo "osv flags present"
+}
+
+go_mod_vulnerable() {
+	printf 'module example.com/fixture\n\ngo 1.21\n\nrequire golang.org/x/text v0.3.0\n'
+}
+
 vulnerable_npm_lockfile() {
 	cat <<'EOF'
 {
@@ -374,20 +482,24 @@ clean_npm_lockfile() {
 EOF
 }
 
-# floor_copy_with <from> <to>: a temp copy of floor.sh with one literal
+# copy_with <file> <from> <to>: a temp copy of <file> with one literal
 # replaced; fails if <from> is not present exactly once.
-floor_copy_with() {
-	local from=$1 to=$2 dir content n
-	content=$(<"$FLOOR_SH")
-	n=$(grep -cF -- "$from" "$FLOOR_SH" || true)
+copy_with() {
+	local file=$1 from=$2 to=$3 dir content n
+	content=$(<"$file")
+	n=$(grep -cF -- "$from" "$file" || true)
 	[[ "$n" == 1 ]] || {
-		echo "floor_copy_with: '$from' found $n times" >&2
+		echo "copy_with: '$from' found $n times" >&2
 		return 1
 	}
 	dir=$(mktemp -d "$WORK/floor-copy.XXXXXX")
 	printf '%s\n' "${content/"$from"/"$to"}" >"$dir/floor.sh"
 	chmod 0755 "$dir/floor.sh"
 	printf '%s\n' "$dir/floor.sh"
+}
+
+floor_copy_with() {
+	copy_with "$FLOOR_SH" "$@"
 }
 
 # floor_with_stubs_on_path <name=script>...: a floor.sh copy whose fixed PATH
@@ -623,6 +735,26 @@ osv_vuln_ignore_repo=$(new_repo)
 commit_file "$osv_vuln_ignore_repo" package-lock.json "$(vulnerable_npm_lockfile)" >/dev/null
 commit_file "$osv_vuln_ignore_repo" osv-scanner.toml "$(osv_ignore_package_toml lodash)" >/dev/null
 
+# Lockfile check fixtures. A manifest's content does not matter to the check.
+pkg_json='{"name": "fixture", "version": "1.0.0"}'
+cargo_toml=$(printf '[package]\nname = "fixture"\nversion = "0.1.0"')
+pyproject_toml=$(printf '[project]\nname = "fixture"\nversion = "0.1.0"')
+osv_workspace_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" packages/a/package.json "$pkg_json")
+osv_lock_in_child_repo=$(files_repo package.json "$pkg_json" sub/package-lock.json "$(clean_npm_lockfile)")
+osv_wrong_kind_repo=$(files_repo Cargo.toml "$cargo_toml" package-lock.json "$(clean_npm_lockfile)")
+osv_untracked_lock_repo=$(files_repo package.json "$pkg_json")
+clean_npm_lockfile >"$osv_untracked_lock_repo/package-lock.json"
+osv_lock_only_empty_repo=$(files_repo package-lock.json "")
+osv_newline_name_repo=$(files_repo $'dir\n::warning::x/package.json' "$pkg_json")
+osv_ignored_sub_repo=$(gitignored_lockfile_repo true)
+osv_unignored_sub_repo=$(gitignored_lockfile_repo false)
+osv_nested_toml_repo=$(gitignored_lockfile_repo false)
+commit_file "$osv_nested_toml_repo" sub/osv-scanner.toml "$(osv_ignore_package_toml lodash)" >/dev/null
+osv_go_repo=$(files_repo go.mod "$(go_mod_vulnerable)")
+go_marker_flag="$WORK/go-called-with-flag"
+go_marker_noflag="$WORK/go-called-without-flag"
+fsmon_home=$(fsmonitor_home)
+
 gitleaks_allow_all="$WORK/gitleaks-allow-all.toml"
 gitleaks_allow_all_toml >"$gitleaks_allow_all"
 
@@ -785,19 +917,102 @@ expect env-attack-clean-repo-green 0 "PASS: gitleaks: no leaks found" -- \
 	SECURITY_FLOOR_REEXEC_PID=1
 
 # An osv-scanner.toml in the scanned tree cannot ignore advisories.
-expect osv-vulnerable-lockfile-red 1 "FAIL: osv: scan failed" -- \
+expect osv-vulnerable-lockfile-red 1 "FAIL: osv: known vulnerabilities found" -- \
 	run_floor "$osv_vuln_repo" osv
-expect osv-repo-ignore-toml-still-red 1 "FAIL: osv: scan failed" -- \
+expect osv-repo-ignore-toml-still-red 1 "FAIL: osv: known vulnerabilities found" -- \
 	run_floor "$osv_vuln_ignore_repo" osv
 expect osv-clean-lockfile-with-toml-green 0 "PASS: osv: no known vulnerabilities" -- \
 	run_floor "$osv_clean_ignore_repo" osv
+expect osv-nested-ignore-toml-still-red 1 "FAIL: osv: known vulnerabilities found" -- \
+	run_floor "$osv_nested_toml_repo" osv
+
+# A tracked lockfile is scanned even when .gitignore lists it; the control
+# has the same files without the .gitignore.
+expect osv-gitignored-tracked-lockfile-red 1 "FAIL: osv: known vulnerabilities found" -- \
+	run_floor "$osv_ignored_sub_repo" osv
+expect osv-same-lockfile-not-ignored-red 1 "FAIL: osv: known vulnerabilities found" -- \
+	run_floor "$osv_unignored_sub_repo" osv
+
+# Exit 128 ("no package sources") passes only when nothing was tracked.
+expect osv-no-manifest-notice-green 0 "::notice title=security-floor::no package manifest or lockfile found" \
+	--contains "lockfile check: no manifest or lockfile tracked" -- \
+	run_floor "$clean_repo" osv
+expect osv-empty-lockfile-no-manifest-red 1 "FAIL: osv: lockfile produced no packages" -- \
+	run_floor "$osv_lock_only_empty_repo" osv
+# The cached binary installs offline; the advisory query then fails.
+expect osv-scan-network-error-red 1 "FAIL: osv-scanner error (exit" --absent "PASS:" -- \
+	run_floor "$osv_vuln_repo" osv https_proxy="$proxy" HTTPS_PROXY="$proxy"
+
+# Lockfile check: one lockless row per manifest kind, named in the output.
+for manifest in Cargo.toml package.json pyproject.toml; do
+	case "$manifest" in
+	Cargo.toml) content=$cargo_toml ;;
+	package.json) content=$pkg_json ;;
+	pyproject.toml) content=$pyproject_toml ;;
+	esac
+	expect "osv-lockless-$manifest-red" 1 "FAIL: lockfile check: 1 manifest(s) without a tracked lockfile" \
+		--contains "no tracked lockfile for manifest: svc/$manifest" -- \
+		run_floor "$(files_repo "svc/$manifest" "$content")" osv
+done
+declare_dynamic_rows 2
+
+# One accept row per lockfile name: the manifest plus an empty lockfile of
+# that name passes the check, and the empty lockfile then fails the scan.
+for pair in Cargo.toml:Cargo.lock package.json:pnpm-lock.yaml package.json:package-lock.json \
+	package.json:yarn.lock package.json:bun.lock pyproject.toml:poetry.lock pyproject.toml:uv.lock; do
+	manifest=${pair%%:*}
+	lockfile=${pair#*:}
+	expect "osv-accepts-$lockfile-empty-red" 1 "FAIL: osv: lockfile produced no packages" \
+		--contains "security-floor: lockfile check: ok" -- \
+		run_floor "$(files_repo "$manifest" "x" "$lockfile" "")" osv
+done
+declare_dynamic_rows 6
+
+expect osv-workspace-member-root-lockfile-green 0 "PASS: osv: no known vulnerabilities" \
+	--contains "security-floor: lockfile check: ok" -- \
+	run_floor "$osv_workspace_repo" osv
+expect osv-lockfile-below-manifest-red 1 "no tracked lockfile for manifest: package.json" -- \
+	run_floor "$osv_lock_in_child_repo" osv
+expect osv-lockfile-of-other-kind-red 1 "no tracked lockfile for manifest: Cargo.toml" -- \
+	run_floor "$osv_wrong_kind_repo" osv
+expect osv-untracked-lockfile-red 1 "no tracked lockfile for manifest: package.json" -- \
+	run_floor "$osv_untracked_lock_repo" osv
+# shellcheck disable=SC2016 # literal expected output
+expect osv-control-char-path-quoted-red 1 "no tracked lockfile for manifest: \$'dir\\n::warning::x/package.json'" -- \
+	run_floor "$osv_newline_name_repo" osv
+
+# The tracked-file listing reads no HOME git config. The control shows the
+# fixture's hook runs for a plain git command.
+expect home-gitconfig-hook-fixture-runs 0 "fsmonitor-hook-ran" -- \
+	env -C "$osv_repo" HOME="$fsmon_home" git ls-files
+expect osv-home-gitconfig-hook-not-run-green 0 "PASS: osv: no known vulnerabilities" --absent "fsmonitor-hook-ran" -- \
+	run_floor "$osv_repo" osv HOME="$fsmon_home"
+
+# Job summary: the OSV table goes to GITHUB_STEP_SUMMARY.
+expect osv-summary-vulnerable-table-red 1 "summary: - result: FAIL, known vulnerabilities found" \
+	--contains "| lodash | 4.17.15 |" -- \
+	run_floor_summary_only "$osv_vuln_repo" osv
+expect osv-summary-clean-green 0 "summary: - result: pass, no known vulnerabilities" --absent "lodash" -- \
+	run_floor_summary_only "$osv_repo" osv
+
+# Call analysis stays off: it would run only where `go` is installed and
+# drop advisories for code judged uncalled. A `go` stub on the fixed PATH
+# records whether osv-scanner probes for it; the control drops the flag.
+expect source-osv-flags 0 "osv flags present" -- check_osv_flags "$FLOOR_SH"
+expect source-osv-flags-check-catches-missing 1 "lacks --no-call-analysis=all" -- \
+	check_osv_flags "$(floor_copy_with ' --no-call-analysis=all' '')"
+expect osv-go-on-path-not-invoked-red 1 "FAIL: osv: known vulnerabilities found" --absent "go was invoked" -- \
+	run_floor_reporting_go "$go_marker_flag" "$(floor_with_go_stub "$go_marker_flag")" "$osv_go_repo"
+expect osv-go-on-path-control-invoked 1 "go was invoked" -- \
+	run_floor_reporting_go "$go_marker_noflag" \
+	"$(floor_with_go_stub "$go_marker_noflag" ' --no-call-analysis=all' '')" "$osv_go_repo"
 
 # Tools run only by absolute path, even when a trusted PATH entry holds a
 # same-named binary; output is redacted.
 expect gitleaks-path-shadow-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor_script "$(floor_with_stubs_on_path 'gitleaks=exit 0' 'osv-scanner=exit 0')" \
 	"$secret_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$push_event"
-expect osv-path-shadow-vulnerable-red 1 "FAIL: osv: scan failed" -- \
+expect osv-path-shadow-vulnerable-red 1 "FAIL: osv: known vulnerabilities found" -- \
 	run_floor_script "$(floor_with_stubs_on_path 'gitleaks=exit 0' 'osv-scanner=exit 0')" \
 	"$osv_vuln_repo" osv
 expect gitleaks-secret-redacted 1 "github-pat" --absent "$secret" -- \
