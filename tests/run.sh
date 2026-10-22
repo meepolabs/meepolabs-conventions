@@ -7,7 +7,7 @@
 #   <grep-text> (fixed string). --absent fails the row if <text> appears.
 #
 # Reconciliation: the run passes only if the emitted PASS lines equal the
-# number of `expect` call sites in this file (lines starting with `expect `)
+# number of `expect` call sites in this file (lines starting with `expect`)
 # plus rows declared with declare_dynamic_rows. A call site inside a loop
 # counts once; the loop declares its extra iterations explicitly.
 set -euo pipefail
@@ -85,7 +85,9 @@ declare_dynamic_rows() {
 
 reconcile() {
 	local call_sites emitted failed expected
-	call_sites=$(grep -cE '^[[:space:]]*expect[[:space:]]' "$SELF")
+	# Counts misspelled calls too (expect_row ...), so a row that silently
+	# stops running still raises the expected total.
+	call_sites=$(grep -cE '^[[:space:]]*expect[A-Za-z0-9_-]*[[:space:]]' "$SELF")
 	emitted=$(grep -c '^PASS ' "$PASS_LOG" || true)
 	failed=$(grep -c '^FAIL ' "$FAIL_LOG" || true)
 	expected=$((call_sites + DYNAMIC_ROWS))
