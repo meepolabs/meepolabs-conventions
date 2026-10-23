@@ -106,6 +106,7 @@ SCAN_RANGE=""
 SCAN_LOG_OPTS=""
 SCAN_REVS=()
 declare -A TRACKED_LOCKFILES=()
+LOCKFILE_PATHS=()
 LOCKFILE_CHECK="not run"
 OSV_SOURCES_FOUND=false
 
@@ -455,30 +456,50 @@ manifest_has_lockfile() {
 # that exists only on the runner proves nothing about the reviewed change.
 # Tracked names are looked up only by plain expansion: `[[ -v map[$key] ]]`
 # would evaluate the subscript a second time.
+# osv-scanner does not follow a symlink (a package manager does), finds
+# nothing in a submodule entry, and skips any lockfile under node_modules/
+# even with --no-ignore: each would leave a tracked file unscanned.
 check_lockfiles() {
-	local listing="$WORK_DIR/tracked" path name manifest locks lock
-	local -a manifests=() lockless=()
+	local listing="$WORK_DIR/tracked" entry mode path name manifest locks lock
+	local -a manifests=() lockless=() unscannable=()
 	local -A lock_names=()
 	for locks in "${MANIFEST_LOCKFILES[@]}"; do
 		for lock in $locks; do
 			lock_names["$lock"]=1
 		done
 	done
-	git_isolated ls-files -z --cached >"$listing" ||
+	git_isolated ls-files -s -z --cached >"$listing" ||
 		osv_fail "not a usable git checkout: cannot list tracked files in $(pwd -P)"
-	while IFS= read -r -d '' path; do
+	while IFS= read -r -d '' entry; do
+		mode=${entry%% *}
+		path=${entry#*$'\t'}
 		name=${path##*/}
 		if [[ -n "${MANIFEST_LOCKFILES["$name"]:-}" ]]; then
 			manifests+=("$path")
 		elif [[ -n "${lock_names["$name"]:-}" ]]; then
 			TRACKED_LOCKFILES["$path"]=1
+			LOCKFILE_PATHS+=("$path")
+			[[ "/$path" == */node_modules/* ]] && unscannable+=("lockfile under node_modules/: $path")
+		else
+			continue
 		fi
+		case "$mode" in
+		120000) unscannable+=("symlink: $path") ;;
+		160000) unscannable+=("submodule entry: $path") ;;
+		esac
 	done <"$listing"
 	((${#manifests[@]} + ${#TRACKED_LOCKFILES[@]} > 0)) && OSV_SOURCES_FOUND=true
 	if [[ "$OSV_SOURCES_FOUND" != true ]]; then
 		LOCKFILE_CHECK="no manifest or lockfile tracked"
 		info "lockfile check: $LOCKFILE_CHECK"
 		return
+	fi
+	if ((${#unscannable[@]} > 0)); then
+		for entry in "${unscannable[@]}"; do
+			printf 'security-floor: osv-scanner cannot scan %s\n' "$(printable_path "$entry")" >&2
+		done
+		LOCKFILE_CHECK="FAIL, ${#unscannable[@]} unscannable manifest or lockfile entries"
+		osv_fail "lockfile check: ${#unscannable[@]} manifest or lockfile entries osv-scanner cannot scan"
 	fi
 	for manifest in "${manifests[@]}"; do
 		manifest_has_lockfile "$manifest" || lockless+=("$manifest")
@@ -513,20 +534,83 @@ osv_fail() {
 	fail "$@"
 }
 
+# osv_scan <config> <root> <format> <output file> [flag...]
 # An empty --config replaces every osv-scanner.toml in the scanned tree, so a
 # repo cannot ignore its own advisories. --no-ignore scans tracked files that
 # .gitignore lists. Call analysis is off because it runs only when `go` is
 # installed, and then drops advisories for code it judges uncalled: the
 # verdict would depend on the runner image.
+osv_scan() {
+	local config=$1 root=$2 format=$3 output=$4
+	shift 4
+	"$WORK_DIR/osv-scanner" scan source --config "$config" --no-ignore --no-call-analysis=all \
+		--format "$format" --output-file "$output" "$@" -r "$root"
+}
+
+# scanned_sources <osv json> <out>: writes, NUL-separated, every result
+# source that holds at least one package. Results that are missing or not in
+# the expected shape fail the run.
+scanned_sources() {
+	local json=$1 out=$2
+	jq -j '.results | if type == "array" then .[] else error("no results array") end
+		| select((.packages | length) > 0) | .source.path + "\u0000"' -- "$json" >"$out" 2>/dev/null ||
+		osv_fail "osv-scanner error: JSON results are missing or unreadable"
+}
+
+# require_lockfiles_scanned <sources> <root> <table>: every tracked lockfile
+# is a scanned source. osv-scanner names a source <root>/<tracked path> for
+# the root it was given, so the root is the physical workspace path.
+require_lockfiles_scanned() {
+	local sources=$1 root=${2%/} table=$3 path
+	local -a missing=()
+	local -A scanned=()
+	while IFS= read -r -d '' path; do
+		scanned["$path"]=1
+	done <"$sources"
+	for path in "${LOCKFILE_PATHS[@]}"; do
+		[[ -n "${scanned["$root/$path"]:-}" ]] || missing+=("$path")
+	done
+	((${#missing[@]} == 0)) && return 0
+	for path in "${missing[@]}"; do
+		printf 'security-floor: lockfile produced no packages: %s\n' "$(printable_path "$path")" >&2
+	done
+	write_osv_summary "FAIL, lockfile produced no packages" "$table"
+	fail "osv: lockfile produced no packages: ${#missing[@]} tracked lockfile(s)"
+}
+
+# The verdict comes from one JSON scan; a second scan renders the table for
+# the log and the job summary only.
 run_osv() {
-	local rc=0 config="$WORK_DIR/osv-scanner.toml" table="$WORK_DIR/osv-results.md"
+	local rc=0 table_rc root config="$WORK_DIR/osv-scanner.toml" json="$WORK_DIR/osv-results.json"
+	local sources="$WORK_DIR/osv-sources" table="$WORK_DIR/osv-results.md"
 	init_git_env
 	check_lockfiles
 	install_osv
+	root=$(pwd -P) || osv_fail "cannot resolve the workspace path"
 	: >"$config" || osv_fail "cannot write osv-scanner config"
-	"$WORK_DIR/osv-scanner" scan source --config "$config" --no-ignore --no-call-analysis=all \
-		--format markdown --output-file "$table" -r . || rc=$?
-	[[ -s "$table" ]] && cat -- "$table"
+	osv_scan "$config" "$root" json "$json" --all-packages || rc=$?
+	case "$rc" in
+	0 | 1)
+		scanned_sources "$json" "$sources"
+		table_rc=0
+		osv_scan "$config" "$root" markdown "$table" >/dev/null 2>&1 || table_rc=$?
+		((table_rc <= 1)) || info "osv-scanner table scan failed (exit $table_rc); the verdict is from the JSON scan"
+		[[ -s "$table" ]] && cat -- "$table"
+		;;
+	128)
+		if [[ "$OSV_SOURCES_FOUND" != true ]]; then
+			printf '::notice title=security-floor::no package manifest or lockfile found; nothing to scan\n'
+			write_osv_summary "pass (no package sources)"
+			pass "osv: no package sources"
+		fi
+		: >"$sources" || osv_fail "cannot write the osv source list"
+		;;
+	*)
+		write_osv_summary "FAIL, osv-scanner error (exit $rc)"
+		fail "osv-scanner error (exit $rc): tool or network failure"
+		;;
+	esac
+	require_lockfiles_scanned "$sources" "$root" "$table"
 	case "$rc" in
 	0)
 		write_osv_summary "pass, no known vulnerabilities" "$table"
@@ -536,18 +620,9 @@ run_osv() {
 		write_osv_summary "FAIL, known vulnerabilities found" "$table"
 		fail "osv: known vulnerabilities found"
 		;;
-	128)
-		if [[ "$OSV_SOURCES_FOUND" == true ]]; then
-			write_osv_summary "FAIL, lockfile produced no packages"
-			fail "osv: lockfile produced no packages (exit 128)"
-		fi
-		printf '::notice title=security-floor::no package manifest or lockfile found; nothing to scan\n'
-		write_osv_summary "pass (no package sources)"
-		pass "osv: no package sources"
-		;;
 	*)
-		write_osv_summary "FAIL, osv-scanner error (exit $rc)" "$table"
-		fail "osv-scanner error (exit $rc): tool or network failure"
+		write_osv_summary "FAIL, lockfile produced no packages"
+		fail "osv: lockfile produced no packages (exit $rc)"
 		;;
 	esac
 }

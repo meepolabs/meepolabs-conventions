@@ -463,6 +463,33 @@ gitignored_lockfile_repo() {
 	printf '%s\n' "$repo"
 }
 
+# symlinked_lockfile_repo: a clean root lockfile, and sub/package-lock.json
+# tracked as a symlink to a vulnerable lockfile stored under another name.
+symlinked_lockfile_repo() {
+	local repo
+	repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" data/lock.json "$(vulnerable_npm_lockfile)")
+	mkdir -p -- "$repo/sub"
+	ln -s ../data/lock.json "$repo/sub/package-lock.json"
+	git -C "$repo" add -- sub/package-lock.json
+	git_in "$repo" commit -q -m "link sub/package-lock.json"
+	printf '%s\n' "$repo"
+}
+
+# gitlink_lockfile_repo: a clean root lockfile, and a submodule entry named
+# sub/package-lock.json.
+gitlink_lockfile_repo() {
+	local repo
+	repo=$(files_repo package-lock.json "$(clean_npm_lockfile)")
+	git -C "$repo" update-index --add --cacheinfo "160000,$(git -C "$repo" rev-parse HEAD),sub/package-lock.json"
+	git_in "$repo" commit -q -m "add sub/package-lock.json submodule entry"
+	printf '%s\n' "$repo"
+}
+
+# An npm lockfile that parses but lists no packages.
+zero_package_npm_lockfile() {
+	printf '{"name": "fixture", "lockfileVersion": 3, "packages": {"": {"name": "fixture"}}}\n'
+}
+
 # fsmonitor_home: a HOME whose ~/.gitconfig runs a hook, which announces
 # itself on stderr, from any git command that reads the index.
 fsmonitor_home() {
@@ -1036,6 +1063,15 @@ osv_unignored_sub_repo=$(gitignored_lockfile_repo false)
 osv_nested_toml_repo=$(gitignored_lockfile_repo false)
 commit_file "$osv_nested_toml_repo" sub/osv-scanner.toml "$(osv_ignore_package_toml lodash)" >/dev/null
 osv_go_repo=$(files_repo go.mod "$(go_mod_vulnerable)")
+osv_symlink_lock_repo=$(symlinked_lockfile_repo)
+osv_gitlink_lock_repo=$(gitlink_lockfile_repo)
+osv_zero_package_sibling_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" \
+	sub/package-lock.json "$(zero_package_npm_lockfile)")
+osv_node_modules_lock_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" \
+	node_modules/x/package-lock.json "$(vulnerable_npm_lockfile)")
+osv_nested_clean_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" sub/package-lock.json "$(clean_npm_lockfile)")
+osv_linked_workspace="$WORK/linked-workspace"
+ln -s -- "$osv_nested_clean_repo" "$osv_linked_workspace"
 go_marker_flag="$WORK/go-called-with-flag"
 go_marker_noflag="$WORK/go-called-without-flag"
 fsmon_home=$(fsmonitor_home)
@@ -1265,6 +1301,33 @@ for pair in Cargo.toml:Cargo.lock package.json:pnpm-lock.yaml package.json:packa
 		run_floor "$(files_repo "$manifest" "x" "$lockfile" "")" osv
 done
 declare_dynamic_rows 6
+
+# Every tracked lockfile must be a scanned source with packages. A tracked
+# entry osv-scanner cannot read fails the lockfile check by name, before the
+# per-lockfile check could also catch it.
+expect osv-symlinked-lockfile-red 1 "osv-scanner cannot scan symlink: sub/package-lock.json" \
+	--contains "FAIL: lockfile check: 1 manifest or lockfile entries osv-scanner cannot scan" -- \
+	run_floor "$osv_symlink_lock_repo" osv
+expect osv-gitlink-lockfile-red 1 "osv-scanner cannot scan submodule entry: sub/package-lock.json" -- \
+	run_floor "$osv_gitlink_lock_repo" osv
+expect osv-node-modules-lockfile-red 1 \
+	"osv-scanner cannot scan lockfile under node_modules/: node_modules/x/package-lock.json" -- \
+	run_floor "$osv_node_modules_lock_repo" osv
+expect osv-zero-package-sibling-red 1 "FAIL: osv: lockfile produced no packages: 1 tracked lockfile(s)" \
+	--contains "lockfile produced no packages: sub/package-lock.json" --absent "package-lock.json, " -- \
+	run_floor "$osv_zero_package_sibling_repo" osv
+# shellcheck disable=SC2016 # literal source text
+expect osv-json-results-missing-red 1 "FAIL: osv-scanner error: JSON results are missing or unreadable" -- \
+	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" json "$json" --all-packages || rc=$?' \
+		'rm -f -- "$json" || rc=$?')" "$osv_repo" osv
+# shellcheck disable=SC2016 # literal source text
+expect osv-json-results-unreadable-red 1 "FAIL: osv-scanner error: JSON results are missing or unreadable" -- \
+	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" json "$json" --all-packages || rc=$?' \
+		'printf "not json" >"$json" || rc=$?')" "$osv_repo" osv
+expect osv-nested-lockfiles-green 0 "PASS: osv: no known vulnerabilities" -- \
+	run_floor "$osv_nested_clean_repo" osv
+expect osv-workspace-through-symlink-green 0 "PASS: osv: no known vulnerabilities" -- \
+	run_floor "$osv_linked_workspace" osv
 
 expect osv-workspace-member-root-lockfile-green 0 "PASS: osv: no known vulnerabilities" \
 	--contains "security-floor: lockfile check: ok" -- \
