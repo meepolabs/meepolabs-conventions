@@ -511,15 +511,50 @@ manifest_has_lockfile() {
 	done
 }
 
+# osv_extracts_path <tracked path>: osv-scanner 2.6.0 `scan source` would
+# extract packages from a regular file at that path. Derived from the source:
+# the command runs the "lockfile", "sbom" and "directory" extractor presets
+# (cmd/osv-scanner/scan/source/command.go, internal/scalibrplugin/presets.go);
+# these are the paths each preset file extractor's FileRequired accepts, in
+# the osv-scalibr commit 2.6.0 pins (extractor/filesystem/language/*,
+# sbom/spdx, sbom/cdx, and internal/scalibrextract/language/osv/osvscannerjson
+# in osv-scanner). The "directory" preset matches directories only, and the
+# apk and dpkg extractors match fixed paths under /, which a checkout never
+# reaches because osv walks from / itself.
+osv_extracts_path() {
+	local path=$1 name=${1##*/} lower ext
+	case "$name" in
+	conan.lock | mix.lock | pubspec.lock | go.mod | gradle.lockfile | buildscript-gradle.lockfile | \
+		pom.xml | *.pom | package-lock.json | npm-shrinkwrap.json | pnpm-lock.yaml | yarn.lock | bun.lock | \
+		composer.lock | Pipfile.lock | pdm.lock | poetry.lock | pylock.toml | pylock.*.toml | uv.lock | \
+		*requirements*.txt | renv.lock | Gemfile.lock | gems.locked | Package.resolved | Cargo.lock | \
+		*.csproj | *.vbproj | *.fsproj | *.deps.json | Directory.Packages.props | Directory.Build.props | \
+		packages.config | packages.lock.json | cabal.project.freeze | stack.yaml.lock | osv-scanner-custom.json)
+		return 0
+		;;
+	esac
+	[[ "/$path" == */gradle/verification-metadata.xml ]] && return 0
+	lower=${name,,}
+	case "$lower" in
+	*.cdx.json | *.cdx.xml | bom.json | bom.xml | *.spdx) return 0 ;;
+	*.spdx.*)
+		ext=${lower##*.}
+		[[ "$ext" == json || "$ext" == spdx || "$ext" == yml || "$ext" == rdf || "$ext" == xml ]] && return 0
+		;;
+	esac
+	return 1
+}
+
 # The lockfile check reads what git tracks, not the working tree: a lockfile
 # that exists only on the runner proves nothing about the reviewed change.
 # Tracked names are looked up only by plain expansion: `[[ -v map[$key] ]]`
 # would evaluate the subscript a second time.
-# osv-scanner does not follow a symlink (a package manager does), finds
-# nothing in a submodule entry, and skips any lockfile under node_modules/
-# even with --no-ignore: each would leave a tracked file unscanned.
+# osv-scanner does not follow a symlink (a package manager does) and finds
+# nothing in a submodule entry, so either fails when osv would otherwise read
+# that path; it also skips any lockfile under node_modules/ even with
+# --no-ignore. Each would leave a tracked dependency file unscanned.
 check_lockfiles() {
-	local listing="$WORK_DIR/tracked" entry mode path name manifest locks lock
+	local listing="$WORK_DIR/tracked" entry mode kind path name manifest locks lock
 	local -a manifests=() lockless=() unscannable=()
 	local -A lock_names=()
 	for locks in "${MANIFEST_LOCKFILES[@]}"; do
@@ -533,32 +568,34 @@ check_lockfiles() {
 		mode=${entry%% *}
 		path=${entry#*$'\t'}
 		name=${path##*/}
+		case "$mode" in
+		120000) kind=symlink ;;
+		160000) kind="submodule entry" ;;
+		*) kind="" ;;
+		esac
+		if [[ -n "$kind" ]] && { [[ -n "${MANIFEST_LOCKFILES["$name"]:-}" ]] || osv_extracts_path "$path"; }; then
+			unscannable+=("$kind: $path")
+		fi
 		if [[ -n "${MANIFEST_LOCKFILES["$name"]:-}" ]]; then
 			manifests+=("$path")
 		elif [[ -n "${lock_names["$name"]:-}" ]]; then
 			TRACKED_LOCKFILES["$path"]=1
 			LOCKFILE_PATHS+=("$path")
 			[[ "/$path" == */node_modules/* ]] && unscannable+=("lockfile under node_modules/: $path")
-		else
-			continue
 		fi
-		case "$mode" in
-		120000) unscannable+=("symlink: $path") ;;
-		160000) unscannable+=("submodule entry: $path") ;;
-		esac
 	done <"$listing"
+	if ((${#unscannable[@]} > 0)); then
+		for entry in "${unscannable[@]}"; do
+			printf 'security-floor: osv-scanner cannot scan %s\n' "$(printable_path "$entry")" >&2
+		done
+		LOCKFILE_CHECK="FAIL, ${#unscannable[@]} unscannable dependency file entries"
+		osv_fail "lockfile check: ${#unscannable[@]} dependency file entries osv-scanner cannot scan"
+	fi
 	((${#manifests[@]} + ${#TRACKED_LOCKFILES[@]} > 0)) && OSV_SOURCES_FOUND=true
 	if [[ "$OSV_SOURCES_FOUND" != true ]]; then
 		LOCKFILE_CHECK="no manifest or lockfile tracked"
 		info "lockfile check: $LOCKFILE_CHECK"
 		return
-	fi
-	if ((${#unscannable[@]} > 0)); then
-		for entry in "${unscannable[@]}"; do
-			printf 'security-floor: osv-scanner cannot scan %s\n' "$(printable_path "$entry")" >&2
-		done
-		LOCKFILE_CHECK="FAIL, ${#unscannable[@]} unscannable manifest or lockfile entries"
-		osv_fail "lockfile check: ${#unscannable[@]} manifest or lockfile entries osv-scanner cannot scan"
 	fi
 	for manifest in "${manifests[@]}"; do
 		manifest_has_lockfile "$manifest" || lockless+=("$manifest")
@@ -593,17 +630,17 @@ osv_fail() {
 	fail "$@"
 }
 
-# osv_scan <config> <root> <format> <output file> [flag...]
+# osv_scan <config> <root> <json output file>
 # An empty --config replaces every osv-scanner.toml in the scanned tree, so a
 # repo cannot ignore its own advisories. --no-ignore scans tracked files that
 # .gitignore lists. Call analysis is off because it runs only when `go` is
 # installed, and then drops advisories for code it judges uncalled: the
-# verdict would depend on the runner image.
+# verdict would depend on the runner image. --all-packages lists every
+# package of every source, which the per-lockfile check needs.
 osv_scan() {
-	local config=$1 root=$2 format=$3 output=$4
-	shift 4
+	local config=$1 root=$2 output=$3
 	"$WORK_DIR/osv-scanner" scan source --config "$config" --no-ignore --no-call-analysis=all \
-		--format "$format" --output-file "$output" "$@" -r "$root"
+		--format json --all-packages --output-file "$output" -r "$root"
 }
 
 # scanned_sources <osv json> <out>: writes, NUL-separated, every result
@@ -613,6 +650,29 @@ scanned_sources() {
 	local json=$1 out=$2
 	jq -j '.results | if type == "array" then .[] else error("no results array") end
 		| select((.packages | length) > 0) | .source.path + "\u0000"' -- "$json" >"$out" 2>/dev/null ||
+		osv_fail "osv-scanner error: JSON results are missing or unreadable"
+}
+
+# render_osv_table <osv json> <root> <out>: a package count line and, when
+# any package has advisories, a markdown table with one row per advisory
+# group. Every cell is lockfile-controlled text, so control characters and
+# the column separator are neutralised.
+render_osv_table() {
+	local json=$1 root=${2%/} out=$3
+	jq -r --arg root "$root/" '
+		def cell: tostring | explode | map(if . < 32 or . == 127 then 32 else . end) | implode
+			| gsub("[|]"; "\\|");
+		[.results[] | (.source.path | ltrimstr($root)) as $src
+			| .packages[] | {src: $src, pkg: .package, groups: (.groups // [])}] as $all
+		| ($all | map(select(.groups | length > 0))) as $vulnerable
+		| "osv-scanner: \($all | length) packages scanned, \($vulnerable | length) with known vulnerabilities",
+		if ($vulnerable | length) > 0 then
+			"",
+			"| OSV URL | CVSS | Ecosystem | Package | Version | Source |",
+			"| --- | --- | --- | --- | --- | --- |",
+			($vulnerable[] | . as $p | .groups[]
+				| "| https://osv.dev/\(.ids[0] | cell) | \(.max_severity // "" | cell) | \($p.pkg.ecosystem | cell) | \($p.pkg.name | cell) | \($p.pkg.version | cell) | \($p.src | cell) |")
+		else empty end' -- "$json" >"$out" 2>/dev/null ||
 		osv_fail "osv-scanner error: JSON results are missing or unreadable"
 }
 
@@ -637,26 +697,29 @@ require_lockfiles_scanned() {
 	fail "osv: lockfile produced no packages: ${#missing[@]} tracked lockfile(s)"
 }
 
-# The verdict comes from one JSON scan; a second scan renders the table for
-# the log and the job summary only.
+# One JSON scan gives the verdict, the per-lockfile check and the table for
+# the log and the job summary. osv-scanner's progress and error lines name
+# repo paths, so they and the table reach the log only inside a command
+# fence.
 run_osv() {
-	local rc=0 table_rc root config="$WORK_DIR/osv-scanner.toml" json="$WORK_DIR/osv-results.json"
+	local rc=0 root config="$WORK_DIR/osv-scanner.toml" json="$WORK_DIR/osv-results.json"
 	local sources="$WORK_DIR/osv-sources" table="$WORK_DIR/osv-results.md"
 	init_git_env
 	check_lockfiles
 	install_osv
 	root=$(pwd -P) || osv_fail "cannot resolve the workspace path"
 	: >"$config" || osv_fail "cannot write osv-scanner config"
-	osv_scan "$config" "$root" json "$json" --all-packages || rc=$?
+	open_command_fence
+	osv_scan "$config" "$root" "$json" 2>&1 || rc=$?
 	case "$rc" in
 	0 | 1)
 		scanned_sources "$json" "$sources"
-		table_rc=0
-		osv_scan "$config" "$root" markdown "$table" >/dev/null 2>&1 || table_rc=$?
-		((table_rc <= 1)) || info "osv-scanner table scan failed (exit $table_rc); the verdict is from the JSON scan"
-		[[ -s "$table" ]] && cat -- "$table"
+		render_osv_table "$json" "$root" "$table"
+		cat -- "$table"
+		close_command_fence
 		;;
 	128)
+		close_command_fence
 		if [[ "$OSV_SOURCES_FOUND" != true ]]; then
 			printf '::notice title=security-floor::no package manifest or lockfile found; nothing to scan\n'
 			write_osv_summary "pass (no package sources)"
@@ -665,6 +728,7 @@ run_osv() {
 		: >"$sources" || osv_fail "cannot write the osv source list"
 		;;
 	*)
+		close_command_fence
 		write_osv_summary "FAIL, osv-scanner error (exit $rc)"
 		fail "osv-scanner error (exit $rc): tool or network failure"
 		;;

@@ -391,14 +391,14 @@ check_commands_fenced() {
 	[[ -n "$token" && "$inside" == false && "$fenced" -gt 0 && "$bare" == 0 ]]
 }
 
-# run_floor_fenced <repo> [NAME=VALUE...]: runs the gitleaks subcommand, then
-# checks its output with check_commands_fenced. Returns 3 when the check
+# run_floor_fenced <repo> <subcommand> [NAME=VALUE...]: runs the subcommand,
+# then checks its output with check_commands_fenced. Returns 3 when the check
 # fails, else the floor's exit code.
 run_floor_fenced() {
-	local repo=$1 log rc=0
-	shift
+	local repo=$1 sub=$2 log rc=0
+	shift 2
 	log=$(mktemp "$WORK/fenced.XXXXXX")
-	run_floor "$repo" gitleaks "$@" >"$log" 2>&1 || rc=$?
+	run_floor "$repo" "$sub" "$@" >"$log" 2>&1 || rc=$?
 	cat -- "$log"
 	check_commands_fenced "$log" || return 3
 	return "$rc"
@@ -625,6 +625,50 @@ gitlink_lockfile_repo() {
 	git -C "$repo" update-index --add --cacheinfo "160000,$(git -C "$repo" rev-parse HEAD),sub/package-lock.json"
 	git_in "$repo" commit -q -m "add sub/package-lock.json submodule entry"
 	printf '%s\n' "$repo"
+}
+
+# symlinked_go_mod_repo: a clean root lockfile, and sub/go.mod tracked as a
+# symlink to a vulnerable go.mod stored under another name. go.mod is not a
+# manifest the lockfile map knows.
+symlinked_go_mod_repo() {
+	local repo
+	repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" data/go-mod.txt "$(go_mod_vulnerable)")
+	mkdir -p -- "$repo/sub"
+	ln -s ../data/go-mod.txt "$repo/sub/go.mod"
+	git -C "$repo" add -- sub/go.mod
+	git_in "$repo" commit -q -m "link sub/go.mod"
+	printf '%s\n' "$repo"
+}
+
+# symlinked_plain_files_repo: a clean root lockfile and tracked symlinks whose
+# names no osv-scanner extractor reads, the shape of a repo that links hooks
+# or docs.
+symlinked_plain_files_repo() {
+	local repo
+	repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" hooks/shared "#!/bin/sh")
+	mkdir -p -- "$repo/a/hooks"
+	ln -s ../../hooks/shared "$repo/a/hooks/pre-app-boot"
+	ln -s ../package-lock.json "$repo/a/lock-link.json"
+	git -C "$repo" add -- a/hooks/pre-app-boot a/lock-link.json
+	git_in "$repo" commit -q -m "link hooks"
+	printf '%s\n' "$repo"
+}
+
+# floor_counting_osv <marker>: a floor.sh copy that appends a line to <marker>
+# each time it starts osv-scanner.
+floor_counting_osv() {
+	# shellcheck disable=SC2016 # literal source text
+	floor_copy_with '	"$WORK_DIR/osv-scanner" scan source' "	echo osv >>'$1'
+	\"\$WORK_DIR/osv-scanner\" scan source"
+}
+
+# run_floor_counting_osv <marker> <script> <repo>: runs the osv subcommand,
+# then prints how many times osv-scanner started.
+run_floor_counting_osv() {
+	local marker=$1 rc=0
+	run_floor_script "$2" "$3" osv || rc=$?
+	echo "osv-scanner invocations: $(grep -c '' -- "$marker" 2>/dev/null || echo 0)"
+	return "$rc"
 }
 
 # An npm lockfile that parses but lists no packages.
@@ -1206,6 +1250,11 @@ osv_nested_toml_repo=$(gitignored_lockfile_repo false)
 commit_file "$osv_nested_toml_repo" sub/osv-scanner.toml "$(osv_ignore_package_toml lodash)" >/dev/null
 osv_go_repo=$(files_repo go.mod "$(go_mod_vulnerable)")
 osv_symlink_lock_repo=$(symlinked_lockfile_repo)
+osv_symlink_go_mod_repo=$(symlinked_go_mod_repo)
+osv_symlink_plain_repo=$(symlinked_plain_files_repo)
+osv_command_dir_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" \
+	$'x\n::warning title=injected::y/package-lock.json' '{not json')
+osv_count_marker="$WORK/osv-invocations"
 osv_gitlink_lock_repo=$(gitlink_lockfile_repo)
 osv_zero_package_sibling_repo=$(files_repo package-lock.json "$(clean_npm_lockfile)" \
 	sub/package-lock.json "$(zero_package_npm_lockfile)")
@@ -1461,8 +1510,14 @@ declare_dynamic_rows 6
 # entry osv-scanner cannot read fails the lockfile check by name, before the
 # per-lockfile check could also catch it.
 expect osv-symlinked-lockfile-red 1 "osv-scanner cannot scan symlink: sub/package-lock.json" \
-	--contains "FAIL: lockfile check: 1 manifest or lockfile entries osv-scanner cannot scan" -- \
+	--contains "FAIL: lockfile check: 1 dependency file entries osv-scanner cannot scan" -- \
 	run_floor "$osv_symlink_lock_repo" osv
+# Any tracked symlink at a path osv-scanner would extract, not only the
+# lockfile map's names; the control holds symlinks no extractor reads.
+expect osv-symlinked-go-mod-red 1 "osv-scanner cannot scan symlink: sub/go.mod" -- \
+	run_floor "$osv_symlink_go_mod_repo" osv
+expect osv-symlinked-plain-files-green 0 "PASS: osv: no known vulnerabilities" --absent "cannot scan" -- \
+	run_floor "$osv_symlink_plain_repo" osv
 expect osv-gitlink-lockfile-red 1 "osv-scanner cannot scan submodule entry: sub/package-lock.json" -- \
 	run_floor "$osv_gitlink_lock_repo" osv
 expect osv-node-modules-lockfile-red 1 \
@@ -1473,11 +1528,11 @@ expect osv-zero-package-sibling-red 1 "FAIL: osv: lockfile produced no packages:
 	run_floor "$osv_zero_package_sibling_repo" osv
 # shellcheck disable=SC2016 # literal source text
 expect osv-json-results-missing-red 1 "FAIL: osv-scanner error: JSON results are missing or unreadable" -- \
-	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" json "$json" --all-packages || rc=$?' \
+	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" "$json" 2>&1 || rc=$?' \
 		'rm -f -- "$json" || rc=$?')" "$osv_repo" osv
 # shellcheck disable=SC2016 # literal source text
 expect osv-json-results-unreadable-red 1 "FAIL: osv-scanner error: JSON results are missing or unreadable" -- \
-	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" json "$json" --all-packages || rc=$?' \
+	run_floor_script "$(floor_copy_with 'osv_scan "$config" "$root" "$json" 2>&1 || rc=$?' \
 		'printf "not json" >"$json" || rc=$?')" "$osv_repo" osv
 expect osv-nested-lockfiles-green 0 "PASS: osv: no known vulnerabilities" -- \
 	run_floor "$osv_nested_clean_repo" osv
@@ -1508,8 +1563,20 @@ expect osv-home-gitconfig-hook-not-run-green 0 "PASS: osv: no known vulnerabilit
 expect osv-summary-vulnerable-table-red 1 "summary: - result: FAIL, known vulnerabilities found" \
 	--contains "| lodash | 4.17.15 |" -- \
 	run_floor_summary_only "$osv_vuln_repo" osv
-expect osv-summary-clean-green 0 "summary: - result: pass, no known vulnerabilities" --absent "lodash" -- \
+expect osv-summary-clean-green 0 "summary: - result: pass, no known vulnerabilities" \
+	--contains "summary: osv-scanner: 1 packages scanned, 0 with known vulnerabilities" --absent "lodash" -- \
 	run_floor_summary_only "$osv_repo" osv
+
+# One osv-scanner run gives the verdict, the per-lockfile check and the table.
+expect osv-single-invocation-red 1 "osv-scanner invocations: 1" --contains "| lodash | 4.17.15 |" -- \
+	run_floor_counting_osv "$osv_count_marker" "$(floor_counting_osv "$osv_count_marker")" "$osv_vuln_repo"
+
+# osv-scanner names a malformed lockfile's path, newline and all, on its
+# error line; that reaches the log only inside the command fence. The failed
+# extraction makes osv-scanner exit with an error, so the run is red.
+expect osv-path-workflow-command-fenced-red 1 "FAIL: osv-scanner error (exit" \
+	--contains "fenced, 0 outside the fence" -- \
+	run_floor_fenced "$osv_command_dir_repo" osv
 
 # Call analysis stays off: it would run only where `go` is installed and
 # drop advisories for code judged uncalled. A `go` stub on the fixed PATH
@@ -1631,7 +1698,7 @@ expect schedule-octopus-merge-red 1 "FAIL: octopus merge in scan range; not scan
 # only inside the stop-commands fence.
 expect gitleaks-path-workflow-command-fenced-red 1 "FAIL: gitleaks: leaks found" \
 	--contains "fenced, 0 outside the fence" -- \
-	run_floor_fenced "$command_path_repo" GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+	run_floor_fenced "$command_path_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
 # Content git would print as "Binary files differ" is still scanned.
 expect attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
