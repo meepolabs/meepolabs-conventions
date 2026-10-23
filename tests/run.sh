@@ -24,6 +24,7 @@ readonly FLOOR_SH="$ROOT/actions/security-floor/floor.sh"
 readonly ACTION_YML="$ROOT/actions/security-floor/action.yml"
 readonly SELF="$ROOT/tests/run.sh"
 readonly PRECOMMIT_CONFIG="$ROOT/.pre-commit-config.yaml"
+readonly WORKFLOW_DIR="$ROOT/.github/workflows"
 readonly ID_HOOK="no-internal-ids"
 readonly ID_HOOK_ACCEPT="$ROOT/tests/id-hook/accept.txt"
 readonly ID_HOOK_REJECT="$ROOT/tests/id-hook/reject.txt"
@@ -1285,6 +1286,81 @@ check_gitleaks_rev_parity() {
 	fi
 }
 
+# ---------------------------------------------------------------- workflows
+
+# Workflow policies as jq programs over one workflow, parsed by yq with
+# anchors expanded. Each yields {checked, violations}. A policy whose key
+# (`on` or `jobs`) is missing or of the wrong type errors, so the file fails.
+# shellcheck disable=SC2016 # jq program text
+declare -rA WORKFLOW_POLICIES=(
+	[pull-request-target]='
+		(.on | if type == "string" then [.] elif type == "array" then .
+			elif type == "object" then keys else error("unrecognized on") end) as $t
+		| {checked: ($t | length),
+			violations: [$t[] | select(. == "pull_request_target") | "trigger pull_request_target"]}'
+	[secrets-inherit]='
+		[.jobs | to_entries[]] as $j
+		| {checked: ($j | length),
+			violations: [$j[] | select(.value.secrets == "inherit") | "job \(.key): secrets: inherit"]}'
+	[timeout]='
+		[.jobs | to_entries[]] as $j
+		| {checked: ($j | length),
+			violations: [$j[] | select(.value["timeout-minutes"] == null) | "job \(.key): no timeout-minutes"]}'
+	[pinned-uses]='
+		[.jobs | to_entries[] | .key as $k | .value
+			| ((.uses // empty), (.steps // [] | .[] | .uses // empty)) | {job: $k, ref: .}] as $u
+		| {checked: ($u | length),
+			violations: [$u[] | select((.ref | type) != "string"
+				or (.ref | test("\\A(\\./|[^@]+@[0-9a-f]{40}\\z)") | not))
+				| "job \(.job): uses \(.ref)"]}'
+)
+
+# check_workflows <policy> <dir>: applies one policy to every file in <dir>.
+# Prints each violation; fails on a violation, a file that does not parse, no
+# files, or nothing to check.
+check_workflows() {
+	local policy=$1 dir=$2 file result line checked=0 bad=0
+	local -a files
+	mapfile -t -d '' files < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+	((${#files[@]} > 0)) || {
+		echo "$policy: no workflow files in $dir"
+		return 1
+	}
+	for file in "${files[@]}"; do
+		if ! result=$(yq -o=json 'explode(.)' "$file" | jq -c "${WORKFLOW_POLICIES[$policy]}"); then
+			echo "$policy: cannot check ${file##*/}"
+			bad=1
+			continue
+		fi
+		checked=$((checked + $(jq -r '.checked' <<<"$result")))
+		while IFS= read -r line; do
+			echo "${file##*/}: $line"
+			bad=1
+		done < <(jq -r '.violations[]' <<<"$result")
+	done
+	[[ "$bad" == 0 && "$checked" -gt 0 ]] || {
+		echo "$policy: FAIL ($checked checked)"
+		return 1
+	}
+	echo "$policy: ok, $checked checked in ${#files[@]} files"
+}
+
+# workflow_dir <content>: a directory holding one workflow with that content.
+workflow_dir() {
+	local dir
+	dir=$(mktemp -d "$WORK/workflows.XXXXXX")
+	printf '%s\n' "$1" >"$dir/fixture.yml"
+	printf '%s\n' "$dir"
+}
+
+# workflow_copy_with <from> <to>: the directory of a self-test.yml copy with
+# one literal replaced.
+workflow_copy_with() {
+	local copy
+	copy=$(copy_with "$WORKFLOW_DIR/self-test.yml" "$1" "$2") || return 1
+	dirname -- "$copy"
+}
+
 # ---------------------------------------------------------------- rows
 
 gitleaks_sha=$(sed -n 's/^readonly GITLEAKS_SHA256="\([0-9a-f]*\)"$/\1/p' "$FLOOR_SH")
@@ -1950,5 +2026,57 @@ expect precommit-gitleaks-rev-parity 0 "gitleaks rev parity: 8.30.1" -- \
 	check_gitleaks_rev_parity "$PRECOMMIT_CONFIG" "$FLOOR_SH"
 expect precommit-gitleaks-rev-parity-catches-drift 1 "gitleaks rev mismatch: hook 'v8.30.0', floor.sh '8.30.1'" -- \
 	check_gitleaks_rev_parity "$(copy_with "$PRECOMMIT_CONFIG" 'rev: v8.30.1' 'rev: v8.30.0')" "$FLOOR_SH"
+
+# Workflow policy over .github/workflows/, read through yq. Each policy has a
+# control on a self-test.yml copy or a small fixture that breaks it.
+readonly WF_JOB='jobs: {j: {runs-on: ubuntu-24.04, timeout-minutes: 1, steps: [{run: "true"}]}}'
+readonly WF_SHA=3d3c42e5aac5ba805825da76410c181273ba90b1
+expect workflow-no-pull-request-target 0 "pull-request-target: ok" -- \
+	check_workflows pull-request-target "$WORKFLOW_DIR"
+expect workflow-pull-request-target-check-catches-trigger 1 "self-test.yml: trigger pull_request_target" -- \
+	check_workflows pull-request-target "$(workflow_copy_with '  workflow_dispatch:' $'  workflow_dispatch:\n  pull_request_target:')"
+expect workflow-pull-request-target-check-catches-list-form 1 "fixture.yml: trigger pull_request_target" -- \
+	check_workflows pull-request-target "$(workflow_dir "on: [push, pull_request_target]"$'\n'"$WF_JOB")"
+expect workflow-pull-request-target-check-ignores-comment 0 "pull-request-target: ok, 1 checked" -- \
+	check_workflows pull-request-target "$(workflow_dir "on: push # not pull_request_target"$'\n'"$WF_JOB")"
+expect workflow-no-secrets-inherit 0 "secrets-inherit: ok" -- \
+	check_workflows secrets-inherit "$WORKFLOW_DIR"
+expect workflow-secrets-inherit-check-catches-inherit 1 "fixture.yml: job call: secrets: inherit" -- \
+	check_workflows secrets-inherit "$(workflow_dir "on: push
+jobs: {call: {uses: \"o/r/.github/workflows/w.yml@$WF_SHA\", secrets: inherit}}")"
+expect workflow-every-job-has-timeout 0 "timeout: ok" -- \
+	check_workflows timeout "$WORKFLOW_DIR"
+expect workflow-timeout-check-catches-missing 1 "self-test.yml: job action: no timeout-minutes" -- \
+	check_workflows timeout "$(workflow_copy_with '    timeout-minutes: 10' '')"
+expect workflow-uses-pinned 0 "pinned-uses: ok" -- \
+	check_workflows pinned-uses "$WORKFLOW_DIR"
+expect workflow-pinned-check-catches-tag 1 "self-test.yml: job checks: uses actions/setup-python@v6" -- \
+	check_workflows pinned-uses "$(workflow_copy_with '      - name: Install pre-commit' \
+		$'      - uses: actions/setup-python@v6\n      - name: Install pre-commit')"
+expect workflow-pinned-check-catches-short-sha 1 "fixture.yml: job j: uses actions/checkout@${WF_SHA:0:12}" -- \
+	check_workflows pinned-uses "$(workflow_dir "on: push
+jobs: {j: {runs-on: x, timeout-minutes: 1, steps: [{uses: \"actions/checkout@${WF_SHA:0:12}\"}]}}")"
+expect workflow-pinned-check-catches-sha-in-comment 1 "fixture.yml: job j: uses actions/checkout@v7" -- \
+	check_workflows pinned-uses "$(workflow_dir "on: push
+jobs:
+  j:
+    runs-on: x
+    timeout-minutes: 1
+    steps:
+      - uses: actions/checkout@v7 # @$WF_SHA")"
+expect workflow-pinned-check-catches-aliased-step 1 "fixture.yml: job j: uses actions/checkout@v7" -- \
+	check_workflows pinned-uses "$(workflow_dir "on: push
+x-step: &step {uses: actions/checkout@v7}
+jobs: {j: {runs-on: x, timeout-minutes: 1, steps: [*step]}}")"
+expect workflow-pinned-check-catches-reusable-call 1 "fixture.yml: job call: uses o/r/.github/workflows/w.yml@main" -- \
+	check_workflows pinned-uses "$(workflow_dir "on: push
+jobs: {call: {uses: o/r/.github/workflows/w.yml@main}}")"
+expect workflow-pinned-check-catches-docker 1 "fixture.yml: job j: uses docker://alpine:3" -- \
+	check_workflows pinned-uses "$(workflow_dir "on: push
+jobs: {j: {runs-on: x, timeout-minutes: 1, steps: [{uses: \"docker://alpine:3\"}]}}")"
+expect workflow-check-fails-unparseable 1 "timeout: cannot check fixture.yml" -- \
+	check_workflows timeout "$(workflow_dir $'on: push\njobs: [unclosed')"
+expect workflow-check-fails-empty-dir 1 "timeout: no workflow files" -- \
+	check_workflows timeout "$(mktemp -d "$WORK/workflows.XXXXXX")"
 
 reconcile

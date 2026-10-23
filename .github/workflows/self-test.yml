@@ -1,0 +1,133 @@
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: pre-commit and self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install pre-commit
+        run: pipx install pre-commit==4.6.2
+      - name: pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure --color always
+      # A row that cannot run here (as root, say) is skipped and still
+      # reconciles, so a green run alone does not prove every row ran.
+      - name: Self-test
+        run: |
+          log="$RUNNER_TEMP/self-test.log"
+          bash tests/run.sh 2>&1 | tee -- "$log"
+          summary=$(grep '^rows: ' -- "$log" | tail -n 1)
+          if [[ ! "$summary" =~ ^rows:\ PASS\ [0-9]+,\ SKIP\ 0,\ FAIL\ 0, ]]; then
+            echo "::error title=self-test::summary line does not report SKIP 0: $summary"
+            exit 1
+          fi
+
+  action:
+    name: security-floor action
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # The workspace-relative form, not $/: actionlint does not accept $/.
+      - name: Positive control (this repository)
+        uses: ./actions/security-floor # zizmor: ignore[self-repository]
+      # Each fixture changes the input of one subcommand only, so the other
+      # stays green and the step outcome is attributable.
+      - name: Fixture (manifest without a lockfile)
+        run: |
+          printf '{"name": "fixture", "version": "1.0.0"}\n' >package.json
+          git add -- package.json
+      - name: Negative control (osv lockfile check)
+        id: osv-red
+        continue-on-error: true
+        uses: ./actions/security-floor # zizmor: ignore[self-repository]
+      # An outcome says only that the action failed, not why: a refusal of
+      # the checkout would be red too. The same script on the same tree must
+      # give the intended verdict, and the other subcommand must pass.
+      - name: Require the osv lockfile verdict
+        run: |
+          floor="$GITHUB_WORKSPACE/actions/security-floor/floor.sh"
+          if ! /bin/bash -p "$floor" gitleaks >"$RUNNER_TEMP/reason-gitleaks.log" 2>&1; then
+            echo "::error title=negative control::gitleaks failed on a fixture meant only for the other scan"
+            exit 1
+          fi
+          rc=0
+          /bin/bash -p "$floor" osv >"$RUNNER_TEMP/reason-osv.log" 2>&1 || rc=$?
+          want='security-floor: FAIL: lockfile check: 1 manifest(s) without a tracked lockfile in their directory or a parent'
+          if [[ "$rc" != 1 ]] || ! grep -qxF -- "$want" "$RUNNER_TEMP/reason-osv.log"; then
+            echo "::error title=negative control::osv did not fail on the lockfile check (exit $rc)"
+            exit 1
+          fi
+      # The secret scan covers the event's commit range, so the event is
+      # pointed at the fixture commit; schedule and dispatch scan all refs.
+      - name: Fixture (committed secret)
+        run: |
+          git rm -q --cached -- package.json
+          rm -- package.json
+          raw=$(head -c 4096 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')
+          if [[ ${#raw} -lt 36 ]]; then
+            echo "::error title=fixture::not enough random bytes"
+            exit 1
+          fi
+          printf 'API_TOKEN=ghp_%s\n' "${raw:0:36}" >app.env
+          git add -- app.env
+          git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false \
+            commit -q -m "fixture: committed secret"
+          fixture_head=$(git rev-parse HEAD)
+          event=$(mktemp)
+          jq --arg h "$fixture_head" '
+            (if has("after") then .after = $h else . end)
+            | (if has("pull_request") then .pull_request.head.sha = $h else . end)' \
+            "$GITHUB_EVENT_PATH" >"$event"
+          cat -- "$event" >"$GITHUB_EVENT_PATH"
+      - name: Negative control (gitleaks)
+        id: gitleaks-red
+        continue-on-error: true
+        uses: ./actions/security-floor # zizmor: ignore[self-repository]
+      - name: Require the gitleaks leak verdict
+        run: |
+          floor="$GITHUB_WORKSPACE/actions/security-floor/floor.sh"
+          if ! /bin/bash -p "$floor" osv >"$RUNNER_TEMP/reason-osv.log" 2>&1; then
+            echo "::error title=negative control::osv failed on a fixture meant only for the other scan"
+            exit 1
+          fi
+          rc=0
+          /bin/bash -p "$floor" gitleaks >"$RUNNER_TEMP/reason-gitleaks.log" 2>&1 || rc=$?
+          if [[ "$rc" != 1 ]] || ! grep -qxF -- 'security-floor: FAIL: gitleaks: leaks found' "$RUNNER_TEMP/reason-gitleaks.log"; then
+            echo "::error title=negative control::gitleaks did not fail on a leak (exit $rc)"
+            exit 1
+          fi
+      - name: Require both negative controls to fail
+        env:
+          OSV_OUTCOME: ${{ steps.osv-red.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks-red.outcome }}
+        run: |
+          if [[ "$OSV_OUTCOME" != failure || "$GITLEAKS_OUTCOME" != failure ]]; then
+            echo "::error title=negative control::expected failure; osv: $OSV_OUTCOME, gitleaks: $GITLEAKS_OUTCOME"
+            exit 1
+          fi
