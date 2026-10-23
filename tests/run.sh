@@ -309,6 +309,101 @@ ignored_secret_repo() {
 	printf '%s\n' "$repo"
 }
 
+# typechange_repo <secret>: app.env starts as a symlink, then a regular file
+# holding the secret replaces it. Prints "<repo> <before> <after>".
+typechange_repo() {
+	local repo before after
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	ln -s README.md "$repo/app.env"
+	git -C "$repo" add -- app.env
+	git_in "$repo" commit -q -m "link app.env"
+	before=$(git -C "$repo" rev-parse HEAD)
+	rm -- "$repo/app.env"
+	after=$(commit_file "$repo" app.env "API_TOKEN=$1")
+	[[ "$(git -C "$repo" diff --name-status "$before" "$after")" == $'T\tapp.env' ]] || {
+		echo "typechange_repo: not a type change" >&2
+		return 1
+	}
+	printf '%s %s %s\n' "$repo" "$before" "$after"
+}
+
+# rename_pr_repo <secret>: a PR adds the secret under node_modules/ (skipped
+# by the default rules' path allowlist), then renames it out. Prints
+# "<repo> <base> <head>".
+rename_pr_repo() {
+	local repo base head
+	repo=$(new_repo)
+	base=$(commit_file "$repo" README.md "fixture")
+	commit_file "$repo" node_modules/x/app.env "API_TOKEN=$1" >/dev/null
+	git -C "$repo" mv -- node_modules/x/app.env app.env
+	git_in "$repo" commit -q -m "move app.env"
+	head=$(git -C "$repo" rev-parse HEAD)
+	printf '%s %s %s\n' "$repo" "$base" "$head"
+}
+
+# octopus_repo <secret>: a three-parent merge whose own change adds the
+# secret. Prints "<repo> <before> <merge>".
+octopus_repo() {
+	local repo before merge parents
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	git -C "$repo" branch one
+	git -C "$repo" branch two
+	before=$(commit_file "$repo" main.txt "main change")
+	git -C "$repo" checkout -q one
+	commit_file "$repo" one.txt "one" >/dev/null
+	git -C "$repo" checkout -q two
+	commit_file "$repo" two.txt "two" >/dev/null
+	git -C "$repo" checkout -q main
+	git_in "$repo" merge -q --no-ff --no-commit one two >/dev/null
+	write_file "$repo" app.env "API_TOKEN=$1"
+	git_in "$repo" commit -q -m "merge one and two"
+	merge=$(git -C "$repo" rev-parse HEAD)
+	parents=$(git -C "$repo" rev-list --parents -n 1 "$merge" | wc -w)
+	[[ "$parents" == 4 ]] || {
+		echo "octopus_repo: merge has $((parents - 1)) parents, want 3" >&2
+		return 1
+	}
+	printf '%s %s %s\n' "$repo" "$before" "$merge"
+}
+
+# check_commands_fenced <log>: the log holds a ::stop-commands:: fence, and
+# every ::warning line sits inside it. Fails when no such line exists, so a
+# fixture that stops producing one cannot pass.
+check_commands_fenced() {
+	local log=$1 line token="" inside=false fenced=0 bare=0
+	while IFS= read -r line; do
+		if [[ "$inside" == false && "$line" =~ ^::stop-commands::([0-9a-f]{32})$ ]]; then
+			token=${BASH_REMATCH[1]}
+			inside=true
+		elif [[ "$inside" == true && "$line" == "::$token::" ]]; then
+			inside=false
+		elif [[ "$line" == ::warning* ]]; then
+			if [[ "$inside" == true ]]; then
+				fenced=$((fenced + 1))
+			else
+				bare=$((bare + 1))
+			fi
+		fi
+	done <"$log"
+	echo "workflow commands: $fenced fenced, $bare outside the fence"
+	[[ -n "$token" && "$inside" == false && "$fenced" -gt 0 && "$bare" == 0 ]]
+}
+
+# run_floor_fenced <repo> [NAME=VALUE...]: runs the gitleaks subcommand, then
+# checks its output with check_commands_fenced. Returns 3 when the check
+# fails, else the floor's exit code.
+run_floor_fenced() {
+	local repo=$1 log rc=0
+	shift
+	log=$(mktemp "$WORK/fenced.XXXXXX")
+	run_floor "$repo" gitleaks "$@" >"$log" 2>&1 || rc=$?
+	cat -- "$log"
+	check_commands_fenced "$log" || return 3
+	return "$rc"
+}
+
 # corrupt_history_repo: HEAD exists but its parent commit object is gone.
 corrupt_history_repo() {
 	local repo parent
@@ -459,6 +554,11 @@ osv_ignore_package_toml() {
 # A gitleaks config that allowlists every path.
 gitleaks_allow_all_toml() {
 	printf '[allowlist]\npaths = [".*"]\n'
+}
+
+# A gitleaks config with one custom rule for a string no default rule flags.
+gitleaks_custom_rule_toml() {
+	printf '[[rules]]\nid = "fixture-marker"\nregex = %s\n' "'FIXTURE_MARKER_[0-9]{8}'"
 }
 
 clean_npm_lockfile() {
@@ -964,6 +1064,14 @@ shallow_repo=$(mktemp -d "$WORK/repo.XXXXXX")
 git clone -q --depth 1 -- "file://$range_repo" "$shallow_repo"
 bad_config_repo=$(new_repo)
 commit_file "$bad_config_repo" .gitleaks.toml "[[rules]" >/dev/null
+toml_allow_all_repo=$(files_repo .gitleaks.toml "$(gitleaks_allow_all_toml)" app.env "API_TOKEN=$secret")
+toml_no_default_repo=$(files_repo .gitleaks.toml $'[extend]\nuseDefault = false' app.env "API_TOKEN=$secret")
+toml_custom_rule_repo=$(files_repo .gitleaks.toml "$(gitleaks_custom_rule_toml)" notes.txt "value=FIXTURE_MARKER_12345678")
+inline_allow_repo=$(files_repo app.env "API_TOKEN=$secret # gitleaks:allow")
+read -r typechange_repo typechange_before typechange_after < <(typechange_repo "$secret")
+read -r rename_repo rename_base rename_head < <(rename_pr_repo "$secret")
+read -r octopus_repo octopus_before octopus_merge < <(octopus_repo "$secret")
+command_path_repo=$(files_repo $'notes\n::warning title=injected::fixture.env' "API_TOKEN=$secret")
 nul_repo=$(nul_byte_secret_repo "$secret")
 attr_secret_repo=$(attributes_repo "$secret")
 attr_clean_repo=$(attributes_repo)
@@ -997,6 +1105,11 @@ ev_after_upper=$(push_event after-upper "$range_c1" "${range_c3^^}")
 ev_evil=$(push_event evil "$evil_before" "$evil_merge")
 ev_conflict=$(push_event conflict "$conflict_before" "$conflict_merge")
 ev_corrupt=$(push_event corrupt "$ZERO" "$corrupt_head")
+ev_typechange=$(push_event typechange "$typechange_before" "$typechange_after")
+ev_octopus=$(push_event octopus "$octopus_before" "$octopus_merge")
+ev_pr_rename=$(pr_event pr-rename "$rename_base" "$rename_head")
+ev_pr_attributes=$(pr_event pr-attributes "$(git -C "$attr_secret_repo" rev-parse HEAD~1)" \
+	"$(git -C "$attr_secret_repo" rev-parse HEAD)")
 ev_pr_long=$(pr_event pr-long "$long_base" "$long_head")
 ev_pr_scoped=$(pr_event pr-scoped "$scoped_base" "$scoped_head")
 ev_pr_after_secret=$(pr_event pr-after-secret "$range_c2" "$range_c3")
@@ -1256,18 +1369,59 @@ expect shallow-clone-red 1 "FAIL: checkout needs fetch-depth: 0" -- \
 	run_floor "$shallow_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect git-too-old-red 1 "FAIL: git 2.36 or newer is required" -- \
 	run_floor_script "$(floor_with_stubs_on_path "$old_git_stub")" "$clean_repo" gitleaks
-expect malformed-gitleaks-toml-red 1 "FAIL: gitleaks error (exit 1): tool or config failure" -- \
+
+# Nothing the scanned repo supplies changes the verdict: only the built-in
+# rules run. The custom-rule control loads the repo config to show its rule
+# fires on the fixture.
+expect malformed-gitleaks-toml-ignored-green 0 "PASS: gitleaks: no leaks found" -- \
 	run_floor "$bad_config_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
-expect gitleaksignore-fingerprint-green 0 "PASS: gitleaks: no leaks found" -- \
+expect repo-toml-allow-all-paths-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$toml_allow_all_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect repo-toml-use-default-false-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$toml_no_default_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect repo-toml-custom-rule-not-loaded-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$toml_custom_rule_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# shellcheck disable=SC2016 # literal source text
+expect repo-toml-custom-rule-control-loaded-red 1 "FAIL: gitleaks: leaks found" --contains "fixture-marker" -- \
+	run_floor_script "$(floor_copy_with '--config "$config" --gitleaks-ignore-path' '--gitleaks-ignore-path')" \
+	"$toml_custom_rule_repo" gitleaks \
+	GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect inline-gitleaks-allow-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$inline_allow_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect gitleaksignore-fingerprint-red 1 "FAIL: repo .gitleaksignore is not honored" -- \
 	run_floor "$ignored_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect gitleaksignore-absent-same-history-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# Change classes plain `git log -p` hides: a type change, a pure rename, a
+# merge seen only by the full-history form, and an octopus merge, which no
+# diff option shows and so fails before the scan.
+expect push-typechange-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$typechange_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_typechange"
+expect schedule-typechange-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$typechange_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect pr-rename-out-of-allowlisted-path-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$rename_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_rename"
+expect schedule-evil-merge-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$evil_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect push-octopus-merge-red 1 "FAIL: octopus merge in scan range; not scannable" -- \
+	run_floor "$octopus_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_octopus"
+expect schedule-octopus-merge-red 1 "FAIL: octopus merge in scan range; not scannable" -- \
+	run_floor "$octopus_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# A tracked path holding a newline and a workflow command reaches the log
+# only inside the stop-commands fence.
+expect gitleaks-path-workflow-command-fenced-red 1 "FAIL: gitleaks: leaks found" \
+	--contains "fenced, 0 outside the fence" -- \
+	run_floor_fenced "$command_path_repo" GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
 # Content git would print as "Binary files differ" is still scanned.
 expect attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$attr_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect nul-byte-file-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$nul_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect pr-attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$attr_secret_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_attributes"
 expect attributes-no-diff-clean-green 0 "PASS: gitleaks: no leaks found" -- \
 	run_floor "$attr_clean_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect home-gitconfig-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \

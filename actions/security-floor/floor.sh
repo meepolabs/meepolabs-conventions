@@ -74,10 +74,13 @@ readonly OSV_SHA256="ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d9748
 
 # gitleaks passes --log-opts to `git log -p` split on single spaces, and the
 # option replaces its default full-history arguments. Plain `git log -p`
-# prints no diff for merge commits (--remerge-diff) and only "Binary files
-# differ" for files git or .gitattributes call binary (--text).
-readonly SCAN_OPTS="--full-history --diff-filter=tuxdb --remerge-diff --text"
-readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=tuxdb --remerge-diff --text"
+# prints no diff for merge commits (--remerge-diff), only "Binary files
+# differ" for files git or .gitattributes call binary (--text), and no
+# content for a pure rename (--no-renames). Each lowercase filter letter
+# excludes one change class; type changes (t, a symlink replaced by a file)
+# must stay in.
+readonly SCAN_OPTS="--full-history --diff-filter=uxdb --remerge-diff --text --no-renames"
+readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=uxdb --remerge-diff --text --no-renames"
 readonly ZERO_SHA="0000000000000000000000000000000000000000"
 readonly GIT_MIN_MAJOR=2
 readonly GIT_MIN_MINOR=36
@@ -335,12 +338,25 @@ select_scan_range() {
 }
 
 # gitleaks treats an unknown revision in --log-opts as an empty scan and
-# exits 0, so the range must resolve before it runs.
+# exits 0, so the range must resolve before it runs. --remerge-diff remerges
+# two-parent merges only: an octopus merge prints no diff of its own, so
+# whatever it adds would go unscanned.
 preflight_scan_range() {
-	local count
+	local count octopus
 	count=$(git_isolated rev-list --count "${SCAN_REVS[@]}" --) ||
 		scan_fail "scan range does not resolve: $SCAN_RANGE"
 	info "scan: event $SCAN_EVENT; mode $SCAN_MODE; range $SCAN_RANGE; $count commits"
+	octopus=$(git_isolated rev-list --min-parents=3 --count "${SCAN_REVS[@]}" --) ||
+		scan_fail "scan range does not resolve: $SCAN_RANGE"
+	[[ "$octopus" == 0 ]] || scan_fail "octopus merge in scan range; not scannable ($octopus commits)"
+}
+
+# gitleaks 8.30.1 reads <source>/.gitleaksignore whatever
+# --gitleaks-ignore-path says, following a symlink, so its presence alone
+# fails the scan.
+refuse_repo_ignore_file() {
+	[[ ! -e .gitleaksignore && ! -L .gitleaksignore ]] ||
+		scan_fail "repo .gitleaksignore is not honored; remove it and rewrite the flagged value"
 }
 
 write_gitleaks_summary() {
@@ -356,6 +372,25 @@ scan_fail() {
 	fail "$@"
 }
 
+# Only gitleaks's built-in rules apply: nothing the scanned repo supplies
+# (.gitleaks.toml, .gitleaksignore, inline gitleaks:allow) changes the result.
+# A finding's file path is repo-controlled and can hold a newline followed by
+# a workflow command, so the runner ignores commands in the tool's output.
+# The resume token is random per run: the output cannot end the fence.
+scan_secrets() {
+	local config="$WORK_DIR/gitleaks.toml" ignore_dir="$WORK_DIR/gitleaks-ignore" token rc=0
+	printf '[extend]\nuseDefault = true\n' >"$config" || scan_fail "cannot write the gitleaks config"
+	mkdir -- "$ignore_dir" || scan_fail "cannot create the gitleaks ignore directory"
+	token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || scan_fail "cannot generate a stop-commands token"
+	[[ "$token" =~ ^[0-9a-f]{32}$ ]] || scan_fail "cannot generate a stop-commands token"
+	printf '::stop-commands::%s\n' "$token"
+	env "${GIT_ENV[@]}" "$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner \
+		--config "$config" --gitleaks-ignore-path "$ignore_dir" --ignore-gitleaks-allow \
+		--log-opts "$SCAN_LOG_OPTS" . 2>&1 || rc=$?
+	printf '::%s::\n' "$token"
+	return "$rc"
+}
+
 run_gitleaks() {
 	local rc=0
 	init_git_env
@@ -367,9 +402,9 @@ run_gitleaks() {
 		pass "gitleaks: branch deletion, nothing to scan"
 	fi
 	preflight_scan_range
+	refuse_repo_ignore_file
 	install_gitleaks
-	env "${GIT_ENV[@]}" "$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner \
-		--log-opts "$SCAN_LOG_OPTS" . || rc=$?
+	scan_secrets || rc=$?
 	case "$rc" in
 	0)
 		write_gitleaks_summary "pass, no leaks found"
