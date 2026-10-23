@@ -414,6 +414,148 @@ corrupt_history_repo() {
 	printf '%s\n' "$repo"
 }
 
+# bang_attributes_pr_repo <secret>: a PR whose head commit adds a
+# .gitattributes line git warns about on stderr, and the secret. Prints
+# "<repo> <base> <head>".
+bang_attributes_pr_repo() {
+	local repo base head
+	repo=$(new_repo)
+	base=$(commit_file "$repo" README.md "fixture")
+	write_file "$repo" .gitattributes '!x text'
+	write_file "$repo" app.env "API_TOKEN=$1"
+	git_in "$repo" commit -q -m "add app.env"
+	head=$(git -C "$repo" rev-parse HEAD)
+	printf '%s %s %s\n' "$repo" "$base" "$head"
+}
+
+# missing_preimage_repo <secret>: a push range that edits app.env to hold the
+# secret, with the pre-push version of app.env deleted from the object store.
+# Every object the range itself reaches is present. Prints
+# "<repo> <before> <after>".
+missing_preimage_repo() {
+	local repo before after blob
+	repo=$(new_repo)
+	before=$(commit_file "$repo" app.env "API_TOKEN=unset")
+	blob=$(git -C "$repo" rev-parse "$before:app.env")
+	after=$(commit_file "$repo" app.env "API_TOKEN=$1")
+	rm -f -- "$repo/.git/objects/${blob:0:2}/${blob:2}"
+	git -C "$repo" cat-file -e "$blob" 2>/dev/null && {
+		echo "missing_preimage_repo: blob still present" >&2
+		return 1
+	}
+	printf '%s %s %s\n' "$repo" "$before" "$after"
+}
+
+# partial_clone_repo: a --filter=blob:none clone whose promisor remote is
+# gone, so the blobs of older commits can be neither read nor fetched.
+partial_clone_repo() {
+	local src dest i
+	src=$(new_repo)
+	git -C "$src" config uploadpack.allowFilter true
+	for i in 1 2 3; do
+		commit_file "$src" notes.txt "version $i" >/dev/null
+	done
+	dest=$(mktemp -d "$WORK/repo.XXXXXX")
+	git clone -q --filter=blob:none -- "file://$src" "$dest" 2>/dev/null
+	rm -rf -- "$src"
+	[[ "$(git -C "$dest" config --get remote.origin.promisor)" == true ]] || {
+		echo "partial_clone_repo: clone is not partial" >&2
+		return 1
+	}
+	printf '%s\n' "$dest"
+}
+
+# rich_clean_repo: a clean history holding a merge, a rename and a
+# .gitattributes, so git log -p walks the paths the scan options change.
+rich_clean_repo() {
+	local repo
+	repo=$(new_repo)
+	commit_file "$repo" .gitattributes '*.env text' >/dev/null
+	commit_file "$repo" README.md "fixture" >/dev/null
+	git -C "$repo" branch side
+	commit_file "$repo" main.txt "main change" >/dev/null
+	git -C "$repo" checkout -q side
+	commit_file "$repo" side.env "API_TOKEN=unset" >/dev/null
+	git -C "$repo" checkout -q main
+	git_in "$repo" merge -q --no-ff --no-edit side
+	git -C "$repo" mv -- side.env renamed.env
+	git_in "$repo" commit -q -m "rename side.env"
+	printf '%s\n' "$repo"
+}
+
+# xdg_attributes_home <attributes line>: a HOME holding git's default
+# attributes file, read when core.attributesFile is unset.
+xdg_attributes_home() {
+	local dir
+	dir=$(mktemp -d "$WORK/home.XXXXXX")
+	mkdir -p -- "$dir/.config/git"
+	printf '%s\n' "$1" >"$dir/.config/git/attributes"
+	printf '%s\n' "$dir"
+}
+
+# replaced_secret_repo <secret>: main holds the secret, and a refs/replace
+# entry swaps that commit for a clean twin.
+replaced_secret_repo() {
+	local repo base secret_commit twin
+	repo=$(new_repo)
+	base=$(commit_file "$repo" README.md "fixture")
+	secret_commit=$(commit_file "$repo" app.env "API_TOKEN=$1")
+	git -C "$repo" checkout -q --detach "$base"
+	twin=$(commit_file "$repo" app.env "API_TOKEN=unset")
+	git -C "$repo" checkout -q main
+	git -C "$repo" replace "$secret_commit" "$twin"
+	printf '%s\n' "$repo"
+}
+
+# textconv_local_repo <secret>: a tracked .gitattributes routes every file
+# through a diff driver whose textconv, set in .git/config, prints nothing.
+textconv_local_repo() {
+	local repo
+	repo=$(files_repo .gitattributes '* diff=t' app.env "API_TOKEN=$1")
+	git -C "$repo" config diff.t.textconv true
+	printf '%s\n' "$repo"
+}
+
+# graft_repo <secret>: a deprecated info/grafts file, which makes git print a
+# hint on stderr for every history walk.
+graft_repo() {
+	local repo head
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	head=$(commit_file "$repo" app.env "API_TOKEN=$1")
+	printf '%s\n' "$head" >"$repo/.git/info/grafts"
+	printf '%s\n' "$repo"
+}
+
+# run_floor_term_in_fence <script> <repo> <marker>: runs the gitleaks
+# subcommand in its own process group and, once the script's git stub has
+# written <marker> (the history walk started inside the command fence),
+# sends SIGTERM to the group, as a runner cancelling the job does. Returns 3
+# unless the log holds exactly one stop and one matching resume line, else the
+# floor's exit code.
+run_floor_term_in_fence() {
+	local script=$1 repo=$2 marker=$3 log pid i rc=0 token stops resumes
+	log=$(mktemp "$WORK/term.XXXXXX")
+	(cd -- "$repo" && exec setsid env -i PATH="$PATH" HOME="$FAKE_HOME" RUNNER_TEMP="$SHARED_RUNNER_TEMP" \
+		GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event" "$script" gitleaks) >"$log" 2>&1 &
+	pid=$!
+	for ((i = 0; i < 600; i++)); do
+		[[ -e "$marker" ]] && break
+		sleep 0.1
+	done
+	[[ -e "$marker" ]] || echo "history walk never started"
+	kill -TERM -- "-$pid" 2>/dev/null || true
+	wait "$pid" || rc=$?
+	cat -- "$log"
+	token=$(sed -n 's/^::stop-commands::\([0-9a-f]\{32\}\)$/\1/p' -- "$log" | head -n 1)
+	stops=$(grep -c '^::stop-commands::' -- "$log" || true)
+	resumes=0
+	[[ -n "$token" ]] && resumes=$(grep -cxF -- "::$token::" "$log" || true)
+	echo "fence: $stops stop, $resumes resume"
+	[[ -e "$marker" && "$stops" == 1 && "$resumes" == 1 ]] || return 3
+	return "$rc"
+}
+
 # run_floor_summary <repo> <subcommand> [NAME=VALUE...]: run_floor with a job
 # summary file, then print the summary with each line prefixed "summary: ".
 run_floor_summary() {
@@ -1116,6 +1258,17 @@ corrupt_repo=$(corrupt_history_repo)
 corrupt_head=$(git -C "$corrupt_repo" rev-parse HEAD)
 no_diff_home=$(gitconfig_home '* -diff')
 textconv_home=$(gitconfig_home '* diff=hide' "$(printf '[diff "hide"]\n\ttextconv = true')")
+read -r bang_attr_repo bang_attr_base bang_attr_head < <(bang_attributes_pr_repo "$secret")
+read -r preimage_repo preimage_before preimage_after < <(missing_preimage_repo "$secret")
+partial_repo=$(partial_clone_repo)
+rich_clean=$(rich_clean_repo)
+xdg_bang_home=$(xdg_attributes_home '!x text')
+replaced_repo=$(replaced_secret_repo "$secret")
+textconv_local=$(textconv_local_repo "$secret")
+grafted_repo=$(graft_repo "$secret")
+term_marker="$WORK/git-log-started"
+# shellcheck disable=SC2016 # literal stub text
+slow_git_log_stub='git=case " $* " in *" log -p -U0 "*) : >'"'$term_marker'"'; sleep 60 ;; esac; exec /usr/bin/git "$@"'
 # shellcheck disable=SC2016 # literal stub text
 old_git_stub='git=[ "$1" = version ] && { echo "git version 2.35.8"; exit 0; }; exec /usr/bin/git "$@"'
 
@@ -1146,6 +1299,8 @@ ev_octopus=$(push_event octopus "$octopus_before" "$octopus_merge")
 ev_pr_rename=$(pr_event pr-rename "$rename_base" "$rename_head")
 ev_pr_attributes=$(pr_event pr-attributes "$(git -C "$attr_secret_repo" rev-parse HEAD~1)" \
 	"$(git -C "$attr_secret_repo" rev-parse HEAD)")
+ev_pr_bang_attr=$(pr_event pr-bang-attr "$bang_attr_base" "$bang_attr_head")
+ev_preimage=$(push_event preimage "$preimage_before" "$preimage_after")
 ev_pr_long=$(pr_event pr-long "$long_base" "$long_head")
 ev_pr_scoped=$(pr_event pr-scoped "$scoped_base" "$scoped_head")
 ev_pr_after_secret=$(pr_event pr-after-secret "$range_c2" "$range_c3")
@@ -1493,6 +1648,37 @@ expect home-gitconfig-textconv-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$secret_repo" gitleaks HOME="$textconv_home"
 expect home-gitconfig-textconv-clean-green 0 "PASS: gitleaks: no leaks found" -- \
 	run_floor "$clean_repo" gitleaks HOME="$textconv_home"
+
+# gitleaks stops at the first git stderr line and still exits 0, so the same
+# git log runs first and any stderr fails the scan. The clean row shows a
+# healthy history with merges and renames prints none.
+expect pr-bang-attributes-stderr-red 1 "FAIL: git log reported errors or warnings" \
+	--contains "security-floor: git: warning: Negative patterns are ignored" -- \
+	run_floor "$bang_attr_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_bang_attr"
+expect push-missing-preimage-blob-red 1 "FAIL: git log reported errors or warnings" \
+	--contains "security-floor: git: fatal: unable to read" -- \
+	run_floor "$preimage_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_preimage"
+expect schedule-graft-hint-red 1 "FAIL: git log reported errors or warnings" \
+	--contains "grafts is deprecated" -- \
+	run_floor "$grafted_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect git-log-preflight-clean-history-green 0 "PASS: gitleaks: no leaks found" --absent "git log reported" -- \
+	run_floor "$rich_clean" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect partial-clone-red 1 "FAIL: checkout is missing 2 objects in the scan range (a partial clone" -- \
+	run_floor "$partial_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# Repo-local and per-user git state that hides content without printing
+# anything: git's default attributes file under HOME, a replace ref, and a
+# textconv driver in .git/config.
+expect home-xdg-attributes-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$secret_repo" gitleaks HOME="$xdg_bang_home"
+expect replace-ref-hidden-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$replaced_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect local-textconv-secret-red 1 "FAIL: gitleaks: leaks found" -- \
+	run_floor "$textconv_local" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# A run cancelled inside the command fence still resumes workflow commands.
+expect sigterm-in-fence-resumes-once 143 "fence: 1 stop, 1 resume" -- \
+	run_floor_term_in_fence "$(floor_with_stubs_on_path "$slow_git_log_stub")" "$clean_repo" "$term_marker"
 
 # The scan trusts the workspace through its own safe.directory, not a HOME
 # config. git's test knob models a checkout owned by another user; the

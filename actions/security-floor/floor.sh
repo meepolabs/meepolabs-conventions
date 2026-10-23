@@ -76,11 +76,12 @@ readonly OSV_SHA256="ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d9748
 # option replaces its default full-history arguments. Plain `git log -p`
 # prints no diff for merge commits (--remerge-diff), only "Binary files
 # differ" for files git or .gitattributes call binary (--text), and no
-# content for a pure rename (--no-renames). Each lowercase filter letter
-# excludes one change class; type changes (t, a symlink replaced by a file)
-# must stay in.
-readonly SCAN_OPTS="--full-history --diff-filter=uxdb --remerge-diff --text --no-renames"
-readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=uxdb --remerge-diff --text --no-renames"
+# content for a pure rename (--no-renames), and a repo's .git/config can
+# route a diff through a textconv filter (--no-textconv). Each lowercase
+# filter letter excludes one change class; type changes (t, a symlink
+# replaced by a file) must stay in.
+readonly SCAN_OPTS="--full-history --diff-filter=uxdb --remerge-diff --text --no-renames --no-textconv"
+readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=uxdb --remerge-diff --text --no-renames --no-textconv"
 readonly ZERO_SHA="0000000000000000000000000000000000000000"
 readonly GIT_MIN_MAJOR=2
 readonly GIT_MIN_MINOR=36
@@ -99,6 +100,8 @@ BASE_DIR=""
 OWNS_BASE_DIR=false
 CACHE_DIR=""
 WORK_DIR=""
+COMMAND_FENCE_TOKEN=""
+LOG_FD=""
 GIT_ENV=()
 SCAN_EVENT=""
 SCAN_MODE=""
@@ -128,7 +131,30 @@ fail() {
 	exit 1
 }
 
+# The runner ignores workflow commands between ::stop-commands::<token> and
+# ::<token>::. Tool output can carry repo-controlled text (a path holding a
+# newline and ::warning ...), so it is printed only inside such a fence. The
+# token is random per run, so that output cannot end the fence early.
+open_command_fence() {
+	local token
+	token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || fail "cannot generate a stop-commands token"
+	[[ "$token" =~ ^[0-9a-f]{32}$ ]] || fail "cannot generate a stop-commands token"
+	COMMAND_FENCE_TOKEN=$token
+	printf '::stop-commands::%s\n' "$token"
+}
+
+# Also called from cleanup, so a run that exits or is signalled inside the
+# fence still resumes workflow commands for the rest of the job, exactly once.
+# It writes to the job log saved at startup: a trap runs under the
+# redirections of whatever command it interrupted (>/dev/null, say).
+close_command_fence() {
+	[[ -n "$COMMAND_FENCE_TOKEN" ]] || return 0
+	printf '::%s::\n' "$COMMAND_FENCE_TOKEN" >&"$LOG_FD"
+	COMMAND_FENCE_TOKEN=""
+}
+
 cleanup() {
+	close_command_fence
 	if [[ "$OWNS_BASE_DIR" == true ]]; then
 		rm -rf -- "$BASE_DIR"
 	elif [[ -n "$WORK_DIR" ]]; then
@@ -236,13 +262,17 @@ install_osv() {
 # git and gitleaks read no system or user git config: a gitconfig under HOME
 # or /etc can hide diffs from `git log -p` (a textconv driver, an attributes
 # file). That also drops any global safe.directory, so the workspace is
-# trusted here explicitly. Set per command, never exported: the process
-# environment stays exactly what assert_sanitized_env checked.
+# trusted here explicitly. git still reads $HOME/.config/git/attributes when
+# core.attributesFile is unset, and refs/replace/ can swap one commit's
+# content for another's, so both are switched off too. Set per command, never
+# exported: the process environment stays exactly what assert_sanitized_env
+# checked.
 init_git_env() {
 	local workspace
 	workspace=$(pwd -P) || fail "cannot resolve the workspace path"
-	GIT_ENV=(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
-		GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$workspace")
+	GIT_ENV=(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1
+		GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$workspace"
+		GIT_CONFIG_KEY_1=core.attributesFile GIT_CONFIG_VALUE_1=/dev/null)
 }
 
 git_isolated() {
@@ -350,6 +380,19 @@ preflight_scan_range() {
 	octopus=$(git_isolated rev-list --min-parents=3 --count "${SCAN_REVS[@]}" --) ||
 		scan_fail "scan range does not resolve: $SCAN_RANGE"
 	[[ "$octopus" == 0 ]] || scan_fail "octopus merge in scan range; not scannable ($octopus commits)"
+	refuse_missing_objects
+}
+
+# A partial clone (--filter) lacks blobs that `git log -p` would fetch on
+# demand from its promisor remote, or fail on when that remote is gone.
+# --missing=print lists each absent object as "?<oid>" without fetching it.
+refuse_missing_objects() {
+	local listing="$WORK_DIR/scan-objects" missing
+	git_isolated rev-list --objects --missing=print "${SCAN_REVS[@]}" -- >"$listing" ||
+		scan_fail "scan range does not resolve: $SCAN_RANGE"
+	missing=$(grep -c '^?' -- "$listing" || true)
+	[[ "$missing" == 0 ]] ||
+		scan_fail "checkout is missing $missing objects in the scan range (a partial clone or a damaged repository); fetch the full history without --filter"
 }
 
 # gitleaks 8.30.1 reads <source>/.gitleaksignore whatever
@@ -373,22 +416,38 @@ scan_fail() {
 	fail "$@"
 }
 
+# gitleaks 8.30.1 stops reading `git log -p` at the first git stderr line it
+# does not recognise (a warning from a .gitattributes line, a deprecation
+# hint, an unreadable object) and still exits 0, possibly part-way through
+# the history. So the exact command it runs (git -C <source> log -p -U0
+# <log-opts split on single spaces>, same environment) runs first, and any
+# stderr or failure fails the scan. Its stderr is repo-influenced, so it is
+# printed only inside the caller's command fence.
+preflight_git_log() {
+	local errf="$WORK_DIR/git-log.err" rc=0
+	local -a log_opts
+	mapfile -t -d ' ' log_opts < <(printf '%s' "$SCAN_LOG_OPTS")
+	git_isolated -C . log -p -U0 "${log_opts[@]}" </dev/null >/dev/null 2>"$errf" || rc=$?
+	[[ "$rc" == 0 && ! -s "$errf" ]] && return 0
+	sed -n '1,5s/^/security-floor: git: /p' -- "$errf"
+	close_command_fence
+	scan_fail "git log reported errors or warnings (exit $rc); history is not scannable"
+}
+
 # Only gitleaks's built-in rules apply: nothing the scanned repo supplies
 # (.gitleaks.toml, .gitleaksignore, inline gitleaks:allow) changes the result.
 # A finding's file path is repo-controlled and can hold a newline followed by
-# a workflow command, so the runner ignores commands in the tool's output.
-# The resume token is random per run: the output cannot end the fence.
+# a workflow command, so all tool output stays inside a command fence.
 scan_secrets() {
-	local config="$WORK_DIR/gitleaks.toml" ignore_dir="$WORK_DIR/gitleaks-ignore" token rc=0
+	local config="$WORK_DIR/gitleaks.toml" ignore_dir="$WORK_DIR/gitleaks-ignore" rc=0
 	printf '[extend]\nuseDefault = true\n' >"$config" || scan_fail "cannot write the gitleaks config"
 	mkdir -- "$ignore_dir" || scan_fail "cannot create the gitleaks ignore directory"
-	token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || scan_fail "cannot generate a stop-commands token"
-	[[ "$token" =~ ^[0-9a-f]{32}$ ]] || scan_fail "cannot generate a stop-commands token"
-	printf '::stop-commands::%s\n' "$token"
+	open_command_fence
+	preflight_git_log
 	env "${GIT_ENV[@]}" "$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner \
 		--config "$config" --gitleaks-ignore-path "$ignore_dir" --ignore-gitleaks-allow \
 		--log-opts "$SCAN_LOG_OPTS" . 2>&1 || rc=$?
-	printf '::%s::\n' "$token"
+	close_command_fence
 	return "$rc"
 }
 
@@ -642,7 +701,10 @@ main() {
 		;;
 	esac
 	check_platform
+	exec {LOG_FD}>&1
 	trap cleanup EXIT
+	trap 'exit 143' TERM
+	trap 'exit 130' INT
 	prepare_dirs
 	"$cmd"
 }
