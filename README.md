@@ -118,8 +118,14 @@ The action runs on Linux x64 only; any other platform fails with
 `unsupported platform`. It runs on:
 
 - GitHub-hosted ubuntu runners, and
-- self-hosted Linux x64 runners that provide git 2.36 or newer, `jq`,
-  `curl`, `tar` and `sha256sum` in `/usr/bin`.
+- self-hosted Linux x64 runners that provide:
+  - `/bin/bash` and `/usr/bin/env`;
+  - git 2.36 or newer, `jq`, `curl`, `tar` and `sha256sum` in `/usr/bin`;
+  - a standard GNU userland (coreutils such as `mktemp`, `head` and `od`,
+    plus `grep` and `sed`) in `/usr/bin` or `/bin`: the script
+    runs with `PATH=/usr/bin:/bin` and nothing else;
+  - a readable `/proc`: the script checks its own environment through
+    `/proc/<pid>/environ` and fails when it cannot read it.
 
 The runner needs outbound HTTPS to GitHub (tool downloads) and to the
 OSV service (advisory lookups). `HTTPS_PROXY` and `NO_PROXY` are honored.
