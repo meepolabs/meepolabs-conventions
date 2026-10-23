@@ -83,8 +83,10 @@ jobs:
             echo "::error title=negative control::osv did not fail on the lockfile check (exit $rc)"
             exit 1
           fi
-      # The secret scan covers the event's commit range, so the event is
-      # pointed at the fixture commit; schedule and dispatch scan all refs.
+      # The runner rewrites $GITHUB_EVENT_PATH from memory before every step,
+      # so the event cannot be pointed at the fixture commit, and a push or
+      # pull request range would leave it out. The script runs here as a
+      # workflow_dispatch, which scans all refs and HEAD.
       - name: Fixture (committed secret)
         run: |
           git rm -q --cached -- package.json
@@ -98,17 +100,6 @@ jobs:
           git add -- app.env
           git -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false \
             commit -q -m "fixture: committed secret"
-          fixture_head=$(git rev-parse HEAD)
-          event=$(mktemp)
-          jq --arg h "$fixture_head" '
-            (if has("after") then .after = $h else . end)
-            | (if has("pull_request") then .pull_request.head.sha = $h else . end)' \
-            "$GITHUB_EVENT_PATH" >"$event"
-          cat -- "$event" >"$GITHUB_EVENT_PATH"
-      - name: Negative control (gitleaks)
-        id: gitleaks-red
-        continue-on-error: true
-        uses: ./actions/security-floor # zizmor: ignore[self-repository]
       - name: Require the gitleaks leak verdict
         run: |
           floor="$GITHUB_WORKSPACE/actions/security-floor/floor.sh"
@@ -116,18 +107,20 @@ jobs:
             echo "::error title=negative control::osv failed on a fixture meant only for the other scan"
             exit 1
           fi
+          event="$RUNNER_TEMP/event-dispatch.json"
+          printf '{}\n' >"$event"
           rc=0
-          /bin/bash -p "$floor" gitleaks >"$RUNNER_TEMP/reason-gitleaks.log" 2>&1 || rc=$?
+          GITHUB_EVENT_NAME=workflow_dispatch GITHUB_EVENT_PATH="$event" \
+            /bin/bash -p "$floor" gitleaks >"$RUNNER_TEMP/reason-gitleaks.log" 2>&1 || rc=$?
           if [[ "$rc" != 1 ]] || ! grep -qxF -- 'security-floor: FAIL: gitleaks: leaks found' "$RUNNER_TEMP/reason-gitleaks.log"; then
             echo "::error title=negative control::gitleaks did not fail on a leak (exit $rc)"
             exit 1
           fi
-      - name: Require both negative controls to fail
+      - name: Require the osv negative control to fail
         env:
           OSV_OUTCOME: ${{ steps.osv-red.outcome }}
-          GITLEAKS_OUTCOME: ${{ steps.gitleaks-red.outcome }}
         run: |
-          if [[ "$OSV_OUTCOME" != failure || "$GITLEAKS_OUTCOME" != failure ]]; then
-            echo "::error title=negative control::expected failure; osv: $OSV_OUTCOME, gitleaks: $GITLEAKS_OUTCOME"
+          if [[ "$OSV_OUTCOME" != failure ]]; then
+            echo "::error title=negative control::expected failure; osv: $OSV_OUTCOME"
             exit 1
           fi

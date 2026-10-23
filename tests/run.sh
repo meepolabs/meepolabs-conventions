@@ -21,7 +21,8 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT
 readonly FLOOR_SH="$ROOT/actions/security-floor/floor.sh"
-readonly ACTION_YML="$ROOT/actions/security-floor/action.yml"
+readonly ACTIONS_DIR="$ROOT/actions"
+readonly ACTION_YML="$ACTIONS_DIR/security-floor/action.yml"
 readonly SELF="$ROOT/tests/run.sh"
 readonly PRECOMMIT_CONFIG="$ROOT/.pre-commit-config.yaml"
 readonly WORKFLOW_DIR="$ROOT/.github/workflows"
@@ -1315,34 +1316,91 @@ declare -rA WORKFLOW_POLICIES=(
 				| "job \(.job): uses \(.ref)"]}'
 )
 
+# apply_policy <name> <program> <base> <file>...: runs one jq program over
+# each file, parsed by yq with anchors expanded, and prints each violation
+# with the file's path under <base>. Fails on a violation, a file that does
+# not parse, or nothing to check.
+apply_policy() {
+	local name=$1 program=$2 base=$3 file result line checked=0 bad=0
+	shift 3
+	for file in "$@"; do
+		if ! result=$(yq -o=json 'explode(.)' "$file" | jq -c "$program"); then
+			echo "$name: cannot check ${file#"$base"/}"
+			bad=1
+			continue
+		fi
+		checked=$((checked + $(jq -r '.checked' <<<"$result")))
+		while IFS= read -r line; do
+			echo "${file#"$base"/}: $line"
+			bad=1
+		done < <(jq -r '.violations[]' <<<"$result")
+	done
+	[[ "$bad" == 0 && "$checked" -gt 0 ]] || {
+		echo "$name: FAIL ($checked checked)"
+		return 1
+	}
+	echo "$name: ok, $checked checked in $# files"
+}
+
 # check_workflows <policy> <dir>: applies one policy to every file in <dir>.
-# Prints each violation; fails on a violation, a file that does not parse, no
-# files, or nothing to check.
 check_workflows() {
-	local policy=$1 dir=$2 file result line checked=0 bad=0
+	local policy=$1 dir=$2
 	local -a files
 	mapfile -t -d '' files < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 | sort -z)
 	((${#files[@]} > 0)) || {
 		echo "$policy: no workflow files in $dir"
 		return 1
 	}
-	for file in "${files[@]}"; do
-		if ! result=$(yq -o=json 'explode(.)' "$file" | jq -c "${WORKFLOW_POLICIES[$policy]}"); then
-			echo "$policy: cannot check ${file##*/}"
-			bad=1
-			continue
-		fi
-		checked=$((checked + $(jq -r '.checked' <<<"$result")))
-		while IFS= read -r line; do
-			echo "${file##*/}: $line"
-			bad=1
-		done < <(jq -r '.violations[]' <<<"$result")
-	done
-	[[ "$bad" == 0 && "$checked" -gt 0 ]] || {
-		echo "$policy: FAIL ($checked checked)"
+	apply_policy "$policy" "${WORKFLOW_POLICIES[$policy]}" "$dir" "${files[@]}"
+}
+
+# Composite action steps: every uses: is local, pinned to a 40-hex commit
+# SHA, or a docker:// image pinned by digest. A file without a runs mapping,
+# or with steps that are not a list, errors, so the file fails. Every step
+# counts as checked, so a composite of run: steps only still checks.
+# shellcheck disable=SC2016 # jq program text
+readonly ACTION_PINNED_USES='
+	(.runs | if type == "object" then . else error("no runs mapping") end
+		| .steps // [] | if type == "array" then . else error("steps is not a list") end) as $s
+	| {checked: ($s | length),
+		violations: [$s | to_entries[] | select(.value | has("uses")) | {n: (.key + 1), ref: .value.uses}
+			| select((.ref | type) != "string"
+				or (.ref | test("\\A(\\./|(?!docker://)[^@]+@[0-9a-f]{40}\\z|docker://[^@]+@sha256:[0-9a-f]{64}\\z)") | not))
+			| "step \(.n): uses \(.ref)"]}'
+
+# check_actions <dir>: the pinning policy over <dir>/*/action.yml and
+# action.yaml. Fails when there are none.
+check_actions() {
+	local dir=$1
+	local -a files
+	mapfile -t -d '' files < <(find "$dir" -mindepth 2 -maxdepth 2 \
+		\( -name action.yml -o -name action.yaml \) -print0 | sort -z)
+	((${#files[@]} > 0)) || {
+		echo "action-pinned-uses: no action files in $dir"
 		return 1
 	}
-	echo "$policy: ok, $checked checked in ${#files[@]} files"
+	apply_policy action-pinned-uses "$ACTION_PINNED_USES" "$dir" "${files[@]}"
+}
+
+# action_dir <content> [<file name>]: an actions directory holding one
+# action with that content, in fixture/action.yml by default.
+action_dir() {
+	local dir
+	dir=$(mktemp -d "$WORK/actions.XXXXXX")
+	mkdir -- "$dir/fixture"
+	printf '%s\n' "$1" >"$dir/fixture/${2:-action.yml}"
+	printf '%s\n' "$dir"
+}
+
+# action_copy_with <from> <to>: an actions directory holding a copy of the
+# security-floor action.yml with one literal replaced.
+action_copy_with() {
+	local copy dir
+	copy=$(copy_with "$ACTION_YML" "$1" "$2") || return 1
+	dir=$(mktemp -d "$WORK/actions.XXXXXX")
+	mkdir -- "$dir/security-floor"
+	mv -- "$copy" "$dir/security-floor/action.yml"
+	printf '%s\n' "$dir"
 }
 
 # workflow_dir <content>: a directory holding one workflow with that content.
@@ -2078,5 +2136,44 @@ expect workflow-check-fails-unparseable 1 "timeout: cannot check fixture.yml" --
 	check_workflows timeout "$(workflow_dir $'on: push\njobs: [unclosed')"
 expect workflow-check-fails-empty-dir 1 "timeout: no workflow files" -- \
 	check_workflows timeout "$(mktemp -d "$WORK/workflows.XXXXXX")"
+
+expect workflow-pull-request-target-check-catches-scalar-form 1 "fixture.yml: trigger pull_request_target" -- \
+	check_workflows pull-request-target "$(workflow_dir "on: pull_request_target"$'\n'"$WF_JOB")"
+
+# The same pinning policy over composite actions under actions/.
+readonly ACTION_RUNS='runs:
+  using: composite
+  steps:'
+expect action-uses-pinned 0 "action-pinned-uses: ok" -- check_actions "$ACTIONS_DIR"
+expect action-pinned-check-accepts-sha-local-and-digest 0 "action-pinned-uses: ok, 4 checked in 1 files" -- \
+	check_actions "$(action_dir "$ACTION_RUNS
+    - uses: actions/checkout@$WF_SHA
+    - uses: ./local
+    - uses: docker://alpine@sha256:$ZERO${ZERO:0:24}
+    - {run: \"true\", shell: bash}")"
+expect action-pinned-check-catches-tag 1 "security-floor/action.yml: step 2: uses owner/x@v1" -- \
+	check_actions "$(action_copy_with '    - id: osv' $'    - uses: owner/x@v1\n    - id: osv')"
+expect action-pinned-check-catches-short-sha 1 "fixture/action.yml: step 1: uses actions/checkout@${WF_SHA:0:12}" -- \
+	check_actions "$(action_dir "$ACTION_RUNS
+    - uses: actions/checkout@${WF_SHA:0:12}")"
+expect action-pinned-check-catches-aliased-step 1 "fixture/action.yml: step 1: uses actions/checkout@v7" -- \
+	check_actions "$(action_dir "x-step: &step {uses: actions/checkout@v7}
+$ACTION_RUNS
+    - *step")"
+expect action-pinned-check-catches-docker-tag 1 "fixture/action.yml: step 1: uses docker://alpine:3" -- \
+	check_actions "$(action_dir "$ACTION_RUNS
+    - uses: docker://alpine:3")"
+expect action-pinned-check-catches-docker-commit-sha 1 "fixture/action.yml: step 1: uses docker://alpine@$WF_SHA" -- \
+	check_actions "$(action_dir "$ACTION_RUNS
+    - uses: docker://alpine@$WF_SHA")"
+expect action-check-fails-unparseable 1 "action-pinned-uses: cannot check fixture/action.yml" -- \
+	check_actions "$(action_dir $'runs:\n  steps: [unclosed')"
+expect action-check-fails-without-runs 1 "action-pinned-uses: cannot check fixture/action.yml" -- \
+	check_actions "$(action_dir 'name: no runs')"
+expect action-check-fails-empty-dir 1 "action-pinned-uses: no action files" -- \
+	check_actions "$(mktemp -d "$WORK/actions.XXXXXX")"
+expect action-check-finds-action-yaml 1 "fixture/action.yaml: step 1: uses owner/x@v1" -- \
+	check_actions "$(action_dir "$ACTION_RUNS
+    - uses: owner/x@v1" action.yaml)"
 
 reconcile
