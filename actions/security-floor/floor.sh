@@ -85,6 +85,9 @@ readonly FULL_HISTORY_OPTS="--full-history --all --diff-filter=uxdb --remerge-di
 readonly ZERO_SHA="0000000000000000000000000000000000000000"
 readonly GIT_MIN_MAJOR=2
 readonly GIT_MIN_MINOR=36
+readonly GITLEAKS_TIMEOUT_SECONDS=600
+readonly GIT_STDERR_LIMIT=65536
+readonly QUOTED_PATH_LIMIT=1024
 
 # Manifest name -> lockfile names that pin it. A manifest is satisfied by a
 # tracked lockfile in its own directory or any parent up to the scan root,
@@ -264,15 +267,17 @@ install_osv() {
 # file). That also drops any global safe.directory, so the workspace is
 # trusted here explicitly. git still reads $HOME/.config/git/attributes when
 # core.attributesFile is unset, and refs/replace/ can swap one commit's
-# content for another's, so both are switched off too. Set per command, never
+# content for another's, so both are switched off too. core.quotePath=false
+# leaves non-ASCII names unquoted (refuse_quoted_paths). Set per command, never
 # exported: the process environment stays exactly what assert_sanitized_env
 # checked.
 init_git_env() {
 	local workspace
 	workspace=$(pwd -P) || fail "cannot resolve the workspace path"
 	GIT_ENV=(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1
-		GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$workspace"
-		GIT_CONFIG_KEY_1=core.attributesFile GIT_CONFIG_VALUE_1=/dev/null)
+		GIT_CONFIG_COUNT=3 GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$workspace"
+		GIT_CONFIG_KEY_1=core.attributesFile GIT_CONFIG_VALUE_1=/dev/null
+		GIT_CONFIG_KEY_2=core.quotePath GIT_CONFIG_VALUE_2=false)
 }
 
 git_isolated() {
@@ -422,16 +427,43 @@ scan_fail() {
 # the history. So the exact command it runs (git -C <source> log -p -U0
 # <log-opts split on single spaces>, same environment) runs first, and any
 # stderr or failure fails the scan. Its stderr is repo-influenced, so it is
-# printed only inside the caller's command fence.
+# printed only inside the caller's command fence, and kept only up to a
+# bound: git stops at SIGPIPE once the bound is reached, which still fails.
 preflight_git_log() {
 	local errf="$WORK_DIR/git-log.err" rc=0
 	local -a log_opts
 	mapfile -t -d ' ' log_opts < <(printf '%s' "$SCAN_LOG_OPTS")
-	git_isolated -C . log -p -U0 "${log_opts[@]}" </dev/null >/dev/null 2>"$errf" || rc=$?
-	[[ "$rc" == 0 && ! -s "$errf" ]] && return 0
-	sed -n '1,5s/^/security-floor: git: /p' -- "$errf"
-	close_command_fence
-	scan_fail "git log reported errors or warnings (exit $rc); history is not scannable"
+	{ git_isolated -C . log -p -U0 "${log_opts[@]}" </dev/null 2>&1 >/dev/null; } |
+		head -c "$GIT_STDERR_LIMIT" >"$errf" || rc=$?
+	if [[ "$rc" != 0 || -s "$errf" ]]; then
+		printf 'security-floor: git stderr kept: %s bytes (limit %s)\n' "$(wc -c <"$errf")" "$GIT_STDERR_LIMIT"
+		head -n 5 -- "$errf" | cut -c 1-512 | sed 's/^/security-floor: git: /'
+		close_command_fence
+		scan_fail "git log reported errors or warnings (exit $rc); history is not scannable"
+	fi
+	refuse_quoted_paths "${log_opts[@]}"
+}
+
+# gitleaks's diff parser (go-gitdiff v0.9.1, parseQuotedName) misreads some
+# quoted names, a name ending in "\" among them, and then stops reading with
+# no git stderr: the scan passes, or stalls once git blocks on the pipe. With
+# core.quotePath=false git quotes a name only for the bytes quote.c's
+# cq_lookup marks: 0x01-0x1f, '"', '\' and 0x7f. So any quoted name in the
+# same walk, merge remerge-diffs included, fails the scan. git's own output
+# decides; it never holds a newline, so the path prints as one log line.
+refuse_quoted_paths() {
+	local out="$WORK_DIR/quoted-path"
+	local -a status=(0 0 0)
+	git_isolated -C . log --format= --name-only "$@" </dev/null 2>/dev/null |
+		grep -m 1 '^"' | head -c "$QUOTED_PATH_LIMIT" >"$out" || status=("${PIPESTATUS[@]}")
+	if [[ -s "$out" ]]; then
+		close_command_fence
+		scan_fail "path git would quote; history is not scannable: $(head -n 1 -- "$out")"
+	fi
+	[[ "${status[0]}" == 0 && "${status[1]}" == 1 ]] || {
+		close_command_fence
+		scan_fail "cannot list the paths in the scan range (exit ${status[*]})"
+	}
 }
 
 # Only gitleaks's built-in rules apply: nothing the scanned repo supplies
@@ -446,7 +478,7 @@ scan_secrets() {
 	preflight_git_log
 	env "${GIT_ENV[@]}" "$WORK_DIR/gitleaks" git --redact --verbose --exit-code 2 --no-banner \
 		--config "$config" --gitleaks-ignore-path "$ignore_dir" --ignore-gitleaks-allow \
-		--log-opts "$SCAN_LOG_OPTS" . 2>&1 || rc=$?
+		--timeout "$GITLEAKS_TIMEOUT_SECONDS" --log-opts "$SCAN_LOG_OPTS" . 2>&1 || rc=$?
 	close_command_fence
 	return "$rc"
 }

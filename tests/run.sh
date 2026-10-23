@@ -404,6 +404,21 @@ run_floor_fenced() {
 	return "$rc"
 }
 
+# run_floor_no_bare_commands <repo> <subcommand> [NAME=VALUE...]: runs the
+# subcommand, then returns 3 if any log line other than a stop-commands fence
+# line starts a workflow command, else the floor's exit code.
+run_floor_no_bare_commands() {
+	local repo=$1 sub=$2 log rc=0 bare
+	shift 2
+	log=$(mktemp "$WORK/bare.XXXXXX")
+	run_floor "$repo" "$sub" "$@" >"$log" 2>&1 || rc=$?
+	cat -- "$log"
+	bare=$(grep -E '^::' -- "$log" | grep -cvE '^::(stop-commands::[0-9a-f]{32}|[0-9a-f]{32}::)$' || true)
+	echo "bare workflow commands: $bare"
+	[[ "$bare" == 0 ]] || return 3
+	return "$rc"
+}
+
 # corrupt_history_repo: HEAD exists but its parent commit object is gone.
 corrupt_history_repo() {
 	local repo parent
@@ -524,6 +539,61 @@ graft_repo() {
 	commit_file "$repo" README.md "fixture" >/dev/null
 	head=$(commit_file "$repo" app.env "API_TOKEN=$1")
 	printf '%s\n' "$head" >"$repo/.git/info/grafts"
+	printf '%s\n' "$repo"
+}
+
+# trailing_backslash_pr_repo <secret>: a plain file holds the secret, then two
+# commits add and edit a file named "t\" whose lines, once the parser has
+# lost the name, read as diff headers. gitleaks then stops before the older
+# commit and passes. Prints "<repo> <base> <head>" for a PR spanning all three.
+trailing_backslash_pr_repo() {
+	local repo base head
+	repo=$(new_repo)
+	base=$(commit_file "$repo" README.md "fixture")
+	commit_file "$repo" app.env "API_TOKEN=$1" >/dev/null
+	commit_file "$repo" "t\\" $'-- /dev/null\na\nb\nc\nold' >/dev/null
+	head=$(commit_file "$repo" "t\\" $'++ b/x\na\nb\nc\nnew')
+	printf '%s %s %s\n' "$repo" "$base" "$head"
+}
+
+# parser_stall_repo: the "t\\" history behind a large diff. Once the parser
+# stops reading, git blocks writing to the pipe and gitleaks waits forever.
+parser_stall_repo() {
+	local repo
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	commit_file "$repo" big.txt "$(seq 1 40000)" >/dev/null
+	commit_file "$repo" "t\\" $'-- /dev/null\na\nb\nc\nold' >/dev/null
+	commit_file "$repo" "t\\" $'++ b/x\na\nb\nc\nnew' >/dev/null
+	printf '%s\n' "$repo"
+}
+
+# quoted_name_merge_repo: a clean merge whose resolution alone adds a file
+# named "t\", so only the remerge diff of the merge commit shows the name.
+quoted_name_merge_repo() {
+	local repo
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	git -C "$repo" branch side
+	commit_file "$repo" main.txt "main change" >/dev/null
+	git -C "$repo" checkout -q side
+	commit_file "$repo" side.txt "side change" >/dev/null
+	git -C "$repo" checkout -q main
+	git_in "$repo" merge -q --no-ff --no-commit side
+	write_file "$repo" "t\\" "fixture"
+	git_in "$repo" commit -q -m "merge side"
+	printf '%s\n' "$repo"
+}
+
+# noisy_attributes_repo: a tracked .gitattributes with thousands of lines git
+# warns about, so git log prints megabytes on stderr.
+noisy_attributes_repo() {
+	local repo
+	repo=$(new_repo)
+	seq -f '!x%g text' 1 10000 >"$repo/.gitattributes"
+	git -C "$repo" add -- .gitattributes 2>/dev/null
+	git_in "$repo" commit -q -m "add .gitattributes" 2>/dev/null
+	commit_file "$repo" README.md "fixture" 2>/dev/null >/dev/null
 	printf '%s\n' "$repo"
 }
 
@@ -973,6 +1043,16 @@ run_floor() {
 	run_floor_script "$FLOOR_SH" "$@"
 }
 
+# run_floor_script_bounded <seconds> <script> <repo> <subcommand> [NAME=VALUE...]:
+# run_floor_script, killed after <seconds> (exit 124) so a hang fails the row.
+run_floor_script_bounded() {
+	local seconds=$1 script=$2 repo=$3 sub=$4
+	shift 4
+	cd -- "$repo"
+	timeout "$seconds" env -i PATH="$PATH" HOME="$FAKE_HOME" RUNNER_TEMP="$SHARED_RUNNER_TEMP" \
+		"$@" "$script" "$sub"
+}
+
 # Runs floor.sh with RUNNER_TEMP unset, then fails unless its private temp
 # directory was removed.
 run_floor_without_runner_temp() {
@@ -1315,6 +1395,18 @@ xdg_bang_home=$(xdg_attributes_home '!x text')
 replaced_repo=$(replaced_secret_repo "$secret")
 textconv_local=$(textconv_local_repo "$secret")
 grafted_repo=$(graft_repo "$secret")
+backslash_name_repo=$(files_repo "t\\" "API_TOKEN=$secret")
+read -r backslash_pr_repo backslash_pr_base backslash_pr_head < <(trailing_backslash_pr_repo "$secret")
+backslash_merge_repo=$(quoted_name_merge_repo)
+utf8_name=$'caf\xc3\xa9.env'
+utf8_secret_repo=$(files_repo "$utf8_name" "API_TOKEN=$secret")
+utf8_clean_repo=$(files_repo "$utf8_name" "API_TOKEN=unset")
+noisy_repo=$(noisy_attributes_repo)
+stall_repo=$(parser_stall_repo)
+# shellcheck disable=SC2016 # literal source text
+floor_no_path_check=$(floor_copy_with '	refuse_quoted_paths "${log_opts[@]}"' '')
+floor_no_path_check_short_timeout=$(copy_with "$floor_no_path_check" \
+	'readonly GITLEAKS_TIMEOUT_SECONDS=600' 'readonly GITLEAKS_TIMEOUT_SECONDS=3')
 term_marker="$WORK/git-log-started"
 # shellcheck disable=SC2016 # literal stub text
 slow_git_log_stub='git=case " $* " in *" log -p -U0 "*) : >'"'$term_marker'"'; sleep 60 ;; esac; exec /usr/bin/git "$@"'
@@ -1349,6 +1441,7 @@ ev_pr_rename=$(pr_event pr-rename "$rename_base" "$rename_head")
 ev_pr_attributes=$(pr_event pr-attributes "$(git -C "$attr_secret_repo" rev-parse HEAD~1)" \
 	"$(git -C "$attr_secret_repo" rev-parse HEAD)")
 ev_pr_bang_attr=$(pr_event pr-bang-attr "$bang_attr_base" "$bang_attr_head")
+ev_pr_backslash=$(pr_event pr-backslash "$backslash_pr_base" "$backslash_pr_head")
 ev_preimage=$(push_event preimage "$preimage_before" "$preimage_after")
 ev_pr_long=$(pr_event pr-long "$long_base" "$long_head")
 ev_pr_scoped=$(pr_event pr-scoped "$scoped_base" "$scoped_head")
@@ -1694,11 +1787,11 @@ expect push-octopus-merge-red 1 "FAIL: octopus merge in scan range; not scannabl
 expect schedule-octopus-merge-red 1 "FAIL: octopus merge in scan range; not scannable" -- \
 	run_floor "$octopus_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
-# A tracked path holding a newline and a workflow command reaches the log
-# only inside the stop-commands fence.
-expect gitleaks-path-workflow-command-fenced-red 1 "FAIL: gitleaks: leaks found" \
-	--contains "fenced, 0 outside the fence" -- \
-	run_floor_fenced "$command_path_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# A tracked path holding a newline and a workflow command is refused, and
+# reaches the log only as git's quoted, single-line form.
+expect gitleaks-path-workflow-command-refused-red 1 "FAIL: path git would quote; history is not scannable" \
+	--contains '"notes\n::warning title=injected::fixture.env"' --contains "bare workflow commands: 0" -- \
+	run_floor_no_bare_commands "$command_path_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
 # Content git would print as "Binary files differ" is still scanned.
 expect attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
@@ -1730,6 +1823,28 @@ expect schedule-graft-hint-red 1 "FAIL: git log reported errors or warnings" \
 	run_floor "$grafted_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect git-log-preflight-clean-history-green 0 "PASS: gitleaks: no leaks found" --absent "git log reported" -- \
 	run_floor "$rich_clean" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# gitleaks's diff parser stops, with nothing on git stderr, at a name git
+# quotes, so any quoted name in the walk fails the scan. UTF-8 names are not
+# quoted (core.quotePath=false) and scan normally.
+expect schedule-backslash-name-secret-red 1 'FAIL: path git would quote; history is not scannable: "t\\"' -- \
+	run_floor "$backslash_name_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect pr-backslash-name-hides-older-secret-red 1 "FAIL: path git would quote; history is not scannable" -- \
+	run_floor "$backslash_pr_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_backslash"
+expect schedule-backslash-name-in-merge-resolution-red 1 "FAIL: path git would quote; history is not scannable" -- \
+	run_floor "$backslash_merge_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect schedule-utf8-name-secret-red 1 "FAIL: gitleaks: leaks found" --absent "path git would quote" -- \
+	run_floor "$utf8_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect schedule-utf8-name-clean-green 0 "PASS: gitleaks: no leaks found" -- \
+	run_floor "$utf8_clean_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# Should the parser stall anyway, gitleaks's own timeout ends the scan red
+# (exit 1, "partial scan") rather than hanging the job. The path check is
+# removed from this copy so the stall can happen at all.
+expect schedule-parser-stall-times-out-red 1 "FAIL: gitleaks error (exit 1)" --contains "partial scan" -- \
+	run_floor_script_bounded 60 "$floor_no_path_check_short_timeout" "$stall_repo" gitleaks \
+	GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect schedule-oversized-git-stderr-bounded-red 1 "FAIL: git log reported errors or warnings" \
+	--contains "git stderr kept: 65536 bytes (limit 65536)" -- \
+	run_floor "$noisy_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect partial-clone-red 1 "FAIL: checkout is missing 2 objects in the scan range (a partial clone" -- \
 	run_floor "$partial_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
