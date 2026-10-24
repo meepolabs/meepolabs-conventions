@@ -77,7 +77,7 @@ concurrency:
 jobs:
   security-floor:
     name: Security floor
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -129,6 +129,12 @@ The action runs on Linux x64 only; any other platform fails with
 
 The runner needs outbound HTTPS to GitHub (tool downloads) and to the
 OSV service (advisory lookups). `HTTPS_PROXY` and `NO_PROXY` are honored.
+
+The example job picks its runner from the repository variable
+`CI_RUNNER`: set it to a self-hosted runner's label to run there, or
+leave it unset for GitHub-hosted runners. Use self-hosted runners for
+private repositories only. A changed variable takes effect on the next
+push or new run; re-running an old run may keep the previous runner.
 
 ### Cost of the weekly run
 
