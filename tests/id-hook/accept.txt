@@ -3,9 +3,6 @@ cast the value to f32.0 first
 DEC-2024
 DEC-1234 is a four-digit code
 dec-12 in lowercase
-vault
-the vault holds old records
-secrets manager in lowercase
 version 1.2.3 released
 dated 2024-01-01 with no suffix
 notes-2024-01-01.md

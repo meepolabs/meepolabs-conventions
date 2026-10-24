@@ -1255,7 +1255,7 @@ id_hook_run() {
 # the file or not.
 id_hook_verdict() {
 	local out=$1 file=$2 want=$3 got=quiet
-	grep -q '^no internal ids or secrets-store names\.\.\.*\(Passed\|Failed\)$' "$out" || {
+	grep -q '^no internal ids\.\.\.*\(Passed\|Failed\)$' "$out" || {
 		echo "id hook did not run:"
 		cat -- "$out"
 		return 2
