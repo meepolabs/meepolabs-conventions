@@ -263,6 +263,14 @@ builds and tests in a separate job.
 It does not upload SARIF results, comment on pull requests, or update
 itself. A new version is adopted by changing the pinned SHA.
 
+## Renovate preset
+
+`default.json` is a shared Renovate preset. Extend it pinned to a release
+tag, `"extends": ["github>meepolabs/meepolabs-conventions#vX.Y.Z"]`, and
+Renovate bumps the tag when a new release is published.
+Each repository keeps its stack-specific groups, custom managers and
+first-party pins in its own `renovate.json`.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) to report a vulnerability.

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a shared Renovate preset, `default.json`, for repositories to extend.
 - The secret scan no longer skips any file by path. gitleaks's default
   config skips lockfiles, `node_modules/`, vendored code, images, fonts
   and binary extensions; the action now ships that config with every

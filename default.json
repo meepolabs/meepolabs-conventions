@@ -1,0 +1,76 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    "group:allNonMajor",
+    "schedule:weekly"
+  ],
+  "baseBranchPatterns": ["develop"],
+  "mode": "full",
+  "timezone": "Etc/UTC",
+  "automerge": false,
+  "minimumReleaseAge": "14 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 8,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "vulnerability"],
+    "schedule": "at any time",
+    "minimumGroupSize": 1
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 4am on monday"]
+  },
+  "pre-commit": {
+    "enabled": true
+  },
+  "github-actions": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Pin exact versions for npm and GitHub Actions only; other managers keep the default range strategy.",
+      "matchManagers": ["npm", "github-actions"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Pin GitHub Actions to commit SHAs, because tags can be moved.",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "description": "A digest-only update of a sha-pinned action or hook means its tag was moved, which release age cannot catch, so it waits for dashboard approval.",
+      "matchManagers": ["github-actions", "pre-commit"],
+      "matchUpdateTypes": ["digest"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Docker registries give no release timestamp, so the release-age wait would hold every image update forever.",
+      "matchDatasources": ["docker"],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Resolve the gitleaks pre-commit hook from GitHub releases, the same source as the gitleaks binary.",
+      "matchManagers": ["pre-commit"],
+      "matchDepNames": ["gitleaks/gitleaks"],
+      "overrideDatasource": "github-releases"
+    },
+    {
+      "description": "Releases of this preset and its actions skip the release-age wait; merging them stays manual.",
+      "matchManagers": ["renovate-config", "github-actions"],
+      "matchDepNames": ["meepolabs/meepolabs-conventions"],
+      "minimumReleaseAge": null
+    },
+    {
+      "description": "Major version bumps need explicit review and never auto-merge.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["major-update"]
+    }
+  ]
+}
