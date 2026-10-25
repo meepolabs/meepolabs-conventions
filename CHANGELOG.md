@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.1
+
+- `default.json`: updates and lock file maintenance run on Saturday,
+  10:00-15:59 UTC, instead of early Monday. Vulnerability fixes still
+  open at any time.
+
 ## v0.1.0
 
 First release:

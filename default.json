@@ -4,12 +4,12 @@
     "config:recommended",
     ":semanticCommits",
     ":dependencyDashboard",
-    "group:allNonMajor",
-    "schedule:weekly"
+    "group:allNonMajor"
   ],
   "baseBranchPatterns": ["develop"],
   "mode": "full",
   "timezone": "Etc/UTC",
+  "schedule": ["* 10-15 * * 6"],
   "automerge": false,
   "minimumReleaseAge": "14 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
@@ -24,7 +24,7 @@
   },
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 4am on monday"]
+    "schedule": ["* 10-15 * * 6"]
   },
   "pre-commit": {
     "enabled": true

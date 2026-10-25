@@ -44,11 +44,12 @@ is one):
 name: security
 
 on:
-  pull_request:
   push:
+    branches: [develop]
+  pull_request:
     branches: [main, develop]
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: '17 13 * * 6'
   workflow_dispatch:
 
 permissions:
@@ -72,7 +73,9 @@ jobs:
 ```
 
 - `fetch-depth: 0` is required; a shallow clone fails.
-- The weekly `schedule` only runs from the default branch.
+- The weekly `schedule` runs early Saturday (13:17 UTC), and only from the
+  default branch. `main` gets no push run: it only receives commits that
+  already passed on `develop`.
 - `CI_RUNNER` is an optional repository variable naming a self-hosted
   runner label (private repositories only); unset means GitHub-hosted.
   A self-hosted runner needs Linux x64, git 2.36 or newer, `jq`, `curl`,
@@ -106,8 +109,9 @@ one is published:
 { "extends": ["github>meepolabs/meepolabs-conventions#vX.Y.Z"] }
 ```
 
-It sets weekly grouped updates on `develop`, a 14-day wait before a new
-release is proposed, SHA-pinned actions, and manual review of majors.
+It sets grouped updates on `develop` once a week (Saturday, 10:00-15:59
+UTC), a 14-day wait before a new release is proposed, SHA-pinned
+actions, and manual review of majors.
 Keep stack-specific groups and repository quirks in the repository's own
 `renovate.json`.
 

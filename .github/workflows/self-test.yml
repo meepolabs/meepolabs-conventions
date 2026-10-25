@@ -2,11 +2,11 @@ name: self-test
 
 on:
   push:
-    branches: [main, develop]
+    branches: [develop]
   pull_request:
     branches: [main, develop]
   schedule:
-    - cron: "23 5 * * 1"
+    - cron: "17 13 * * 6"
   workflow_dispatch:
 
 permissions:
