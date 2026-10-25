@@ -115,6 +115,15 @@ actions, and manual review of majors.
 Keep stack-specific groups and repository quirks in the repository's own
 `renovate.json`.
 
+Renovate replaces Dependabot's pull requests. Once Renovate is running
+in a repository:
+
+- Delete `.github/dependabot.yml`, if there is one.
+- Turn off Dependabot security updates:
+  `gh api -X DELETE repos/OWNER/REPO/automated-security-fixes`.
+- Keep the dependency graph and Dependabot alerts on. Renovate reads the
+  alerts to open vulnerability fixes at any time.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) to report a vulnerability.
