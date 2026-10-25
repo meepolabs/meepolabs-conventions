@@ -161,8 +161,13 @@ repository per week.
 Merge commits are scanned, including content introduced only while
 resolving a merge.
 
-gitleaks runs with its built-in rules only. Nothing in the scanned
-repository can relax the verdict:
+gitleaks runs with the rules of its default config, shipped with the
+action as `actions/security-floor/gitleaks.toml`. No file is skipped by
+path: every file's content is scanned as stored in git, lockfiles,
+vendored code, images and binaries included; compressed archives (`.gz`,
+`.zip`, ...) are not unpacked. gitleaks's checks for placeholder values
+(such as `${{ secrets.NAME }}` or `$VAR`) stay, so a reference to a
+secret is not a finding. Nothing in the scanned repository can relax the verdict:
 
 - A repository `.gitleaks.toml` (rules and allowlists) is ignored.
 - Inline `gitleaks:allow` comments are ignored.

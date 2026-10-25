@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The secret scan no longer skips any file by path. gitleaks's default
+  config skips lockfiles, `node_modules/`, vendored code, images, fonts
+  and binary extensions; the action now ships that config with every
+  path skip removed. Its checks for placeholder values stay. A secret in
+  a previously skipped file turns the scan red.
+
 ## v1.0.0
 
 First release of `actions/security-floor`: a secret scan (gitleaks

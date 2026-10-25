@@ -68,6 +68,7 @@ umask 077
 readonly GITLEAKS_VERSION="8.30.1"
 readonly GITLEAKS_URL="https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
 readonly GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+readonly GITLEAKS_CONFIG_SHA256="8f02b240183786d0a16f7331fd8c2f1485f6fb01f9742ccfe432d1bb27afd5cf"
 readonly OSV_VERSION="2.6.0"
 readonly OSV_URL="https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64"
 readonly OSV_SHA256="ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108"
@@ -466,13 +467,21 @@ refuse_quoted_paths() {
 	}
 }
 
-# Only gitleaks's built-in rules apply: nothing the scanned repo supplies
-# (.gitleaks.toml, .gitleaksignore, inline gitleaks:allow) changes the result.
+# Only the gitleaks.toml shipped next to this script applies: nothing the
+# scanned repo supplies (.gitleaks.toml, .gitleaksignore, inline
+# gitleaks:allow) changes the result. gitleaks skips the file whose path
+# equals --config, so the scan reads a copy under WORK_DIR, a path no scanned
+# file can have. The copy must match its pinned hash: a config that loads no
+# rules (empty, comments only) would pass everything.
 # A finding's file path is repo-controlled and can hold a newline followed by
 # a workflow command, so all tool output stays inside a command fence.
 scan_secrets() {
 	local config="$WORK_DIR/gitleaks.toml" ignore_dir="$WORK_DIR/gitleaks-ignore" rc=0
-	printf '[extend]\nuseDefault = true\n' >"$config" || scan_fail "cannot write the gitleaks config"
+	local shipped
+	shipped="$(dirname -- "$0")/gitleaks.toml"
+	cp -- "$shipped" "$config" || scan_fail "cannot read the gitleaks config: $shipped"
+	(verify_sha256 "$config" "$GITLEAKS_CONFIG_SHA256" "gitleaks config") ||
+		scan_fail "gitleaks config does not match its pinned checksum"
 	mkdir -- "$ignore_dir" || scan_fail "cannot create the gitleaks ignore directory"
 	open_command_fence
 	preflight_git_log

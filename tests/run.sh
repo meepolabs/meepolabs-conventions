@@ -21,6 +21,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly ROOT
 readonly FLOOR_SH="$ROOT/actions/security-floor/floor.sh"
+readonly GITLEAKS_TOML="$ROOT/actions/security-floor/gitleaks.toml"
 readonly ACTIONS_DIR="$ROOT/actions"
 readonly ACTION_YML="$ACTIONS_DIR/security-floor/action.yml"
 readonly SELF="$ROOT/tests/run.sh"
@@ -264,8 +265,7 @@ long_pr_repo() {
 }
 
 # nul_byte_secret_repo <secret>: the secret sits in a file git calls binary
-# only because of a NUL byte. The name keeps a text extension: gitleaks's
-# default config skips paths with binary extensions (.bin, ...) by name.
+# only because of a NUL byte.
 nul_byte_secret_repo() {
 	local repo
 	repo=$(new_repo)
@@ -330,15 +330,14 @@ typechange_repo() {
 	printf '%s %s %s\n' "$repo" "$before" "$after"
 }
 
-# rename_pr_repo <secret>: a PR adds the secret under node_modules/ (skipped
-# by the default rules' path allowlist), then renames it out. Prints
-# "<repo> <base> <head>".
+# rename_pr_repo <secret>: the base already holds the secret; the PR only
+# renames the file, so only a diff that shows renames as delete plus add
+# carries the secret. Prints "<repo> <base> <head>".
 rename_pr_repo() {
 	local repo base head
 	repo=$(new_repo)
-	base=$(commit_file "$repo" README.md "fixture")
-	commit_file "$repo" node_modules/x/app.env "API_TOKEN=$1" >/dev/null
-	git -C "$repo" mv -- node_modules/x/app.env app.env
+	base=$(commit_file "$repo" old/app.env "API_TOKEN=$1")
+	git -C "$repo" mv -- old/app.env app.env
 	git_in "$repo" commit -q -m "move app.env"
 	head=$(git -C "$repo" rev-parse HEAD)
 	printf '%s %s %s\n' "$repo" "$base" "$head"
@@ -875,9 +874,11 @@ EOF
 }
 
 # copy_with <file> <from> <to>: a temp copy of <file> with one literal
-# replaced; fails if <from> is not present exactly once.
+# replaced; fails if <from> is not present exactly once. A gitleaks.toml next
+# to <file> is copied along, as floor.sh reads its config from its own
+# directory.
 copy_with() {
-	local file=$1 from=$2 to=$3 dir content n copy
+	local file=$1 from=$2 to=$3 dir content n copy sibling
 	content=$(<"$file")
 	n=$(grep -cF -- "$from" "$file" || true)
 	[[ "$n" == 1 ]] || {
@@ -886,6 +887,8 @@ copy_with() {
 	}
 	dir=$(mktemp -d "$WORK/floor-copy.XXXXXX")
 	copy="$dir/$(basename -- "$file")"
+	sibling="$(dirname -- "$file")/gitleaks.toml"
+	[[ ! -e "$sibling" ]] || cp -- "$sibling" "$dir/"
 	printf '%s\n' "${content/"$from"/"$to"}" >"$copy"
 	chmod 0755 "$copy"
 	printf '%s\n' "$copy"
@@ -1072,7 +1075,7 @@ run_floor_without_runner_temp() {
 # nothing that looks like a pin is read from the environment.
 check_pins_literal() {
 	local file=$1 name n bad=0 found
-	local -a pins=(GITLEAKS_VERSION GITLEAKS_URL GITLEAKS_SHA256 OSV_VERSION OSV_URL OSV_SHA256)
+	local -a pins=(GITLEAKS_VERSION GITLEAKS_URL GITLEAKS_SHA256 GITLEAKS_CONFIG_SHA256 OSV_VERSION OSV_URL OSV_SHA256)
 	for name in "${pins[@]}"; do
 		n=$(grep -cE "^readonly ${name}=\"[^\$\`\"]+\"\$" "$file" || true)
 		if [[ "$n" != 1 ]]; then
@@ -1271,6 +1274,46 @@ fixture_lines() {
 	n=$(grep -c '' "$1" || true)
 	echo "$1: $n lines"
 	[[ "$n" -gt 0 ]]
+}
+
+# check_config_no_path_skips <gitleaks.toml>: the config parses, defines
+# rules, and has no `paths` or `commits` key and no [extend] table at any
+# depth (an extended default config would bring its path allowlists back).
+# gitleaks reads keys case-insensitively, so they are compared lowercased.
+check_config_no_path_skips() {
+	local json rules skips
+	json=$(yq -p toml -o json '.' "$1") || {
+		echo "gitleaks config: cannot parse $1"
+		return 1
+	}
+	rules=$(jq '.rules | length' <<<"$json")
+	skips=$(jq '[.. | objects | keys[] | ascii_downcase | select(. == "paths" or . == "commits" or . == "extend")] | length' <<<"$json")
+	echo "gitleaks config: $rules rules, $skips paths/commits/extend keys"
+	[[ "$rules" -gt 0 && "$skips" == 0 ]]
+}
+
+# check_config_version <gitleaks.toml> <floor.sh>: the upstream version named
+# on the config's first line is the version floor.sh pins.
+check_config_version() {
+	local recorded pin
+	recorded=$(sed -n '1s/^# gitleaks v\([0-9][0-9.]*\) default config.*$/\1/p' "$1")
+	pin=$(sed -n 's/^readonly GITLEAKS_VERSION="\([^"]*\)"$/\1/p' "$2")
+	if [[ -n "$pin" && "$recorded" == "$pin" ]]; then
+		echo "gitleaks config version: $pin"
+	else
+		echo "gitleaks config version mismatch: config '$recorded', floor.sh '$pin'"
+		return 1
+	fi
+}
+
+# floor_with_config <content|--absent>: a floor.sh copy whose gitleaks.toml
+# holds <content>, or is missing.
+floor_with_config() {
+	local dir
+	dir=$(mktemp -d "$WORK/floor-copy.XXXXXX")
+	cp -- "$FLOOR_SH" "$dir/"
+	[[ "$1" == --absent ]] || printf '%s' "$1" >"$dir/gitleaks.toml"
+	printf '%s\n' "$dir/floor.sh"
 }
 
 # check_gitleaks_rev_parity <config> <floor.sh>: the hook rev, without its
@@ -1514,6 +1557,8 @@ read -r rename_repo rename_base rename_head < <(rename_pr_repo "$secret")
 read -r octopus_repo octopus_before octopus_merge < <(octopus_repo "$secret")
 command_path_repo=$(files_repo $'notes\n::warning title=injected::fixture.env' "API_TOKEN=$secret")
 nul_repo=$(nul_byte_secret_repo "$secret")
+bin_secret_repo=$(files_repo app.bin "API_TOKEN=$secret")
+lockfile_secret_repo=$(files_repo pnpm-lock.yaml "API_TOKEN=$secret")
 attr_secret_repo=$(attributes_repo "$secret")
 attr_clean_repo=$(attributes_repo)
 ignored_repo=$(ignored_secret_repo "$secret_repo")
@@ -1882,8 +1927,8 @@ expect shallow-clone-red 1 "FAIL: checkout needs fetch-depth: 0" -- \
 expect git-too-old-red 1 "FAIL: git 2.36 or newer is required" -- \
 	run_floor_script "$(floor_with_stubs_on_path "$old_git_stub")" "$clean_repo" gitleaks
 
-# Nothing the scanned repo supplies changes the verdict: only the built-in
-# rules run. The custom-rule control loads the repo config to show its rule
+# Nothing the scanned repo supplies changes the verdict: only the shipped
+# config's rules run. The custom-rule control loads the repo config to show its rule
 # fires on the fixture.
 expect malformed-gitleaks-toml-ignored-green 0 "PASS: gitleaks: no leaks found" -- \
 	run_floor "$bad_config_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
@@ -1912,7 +1957,7 @@ expect push-typechange-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$typechange_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_typechange"
 expect schedule-typechange-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$typechange_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
-expect pr-rename-out-of-allowlisted-path-red 1 "FAIL: gitleaks: leaks found" -- \
+expect pr-pure-rename-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$rename_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_rename"
 expect schedule-evil-merge-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$evil_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
@@ -1932,6 +1977,25 @@ expect attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$attr_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect nul-byte-file-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$nul_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# No file is skipped by path: gitleaks's default config skips both of these
+# names (binary extensions, lockfiles).
+expect binary-extension-secret-red 1 "FAIL: gitleaks: leaks found" --contains "File:        app.bin" -- \
+	run_floor "$bin_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect lockfile-secret-red 1 "FAIL: gitleaks: leaks found" --contains "File:        pnpm-lock.yaml" -- \
+	run_floor "$lockfile_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
+# The shipped config must be present and match its pinned hash: an empty or
+# edited one could load no rules, and there is no fallback to gitleaks's
+# defaults. The modified copy differs by one character.
+expect gitleaks-config-missing-red 1 "FAIL: cannot read the gitleaks config" -- \
+	run_floor_script "$(floor_with_config --absent)" "$secret_repo" gitleaks
+expect gitleaks-config-empty-red 1 "FAIL: gitleaks config does not match its pinned checksum" -- \
+	run_floor_script "$(floor_with_config '')" "$secret_repo" gitleaks
+expect gitleaks-config-modified-red 1 "FAIL: gitleaks config does not match its pinned checksum" \
+	--contains "checksum mismatch: gitleaks config" -- \
+	run_floor_script "$(floor_with_config "$(sed 's/^title = "gitleaks config"$/title = "gitleaks configs"/' -- "$GITLEAKS_TOML")"$'\n')" \
+		"$secret_repo" gitleaks
 expect pr-attributes-no-diff-secret-red 1 "FAIL: gitleaks: leaks found" -- \
 	run_floor "$attr_secret_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_attributes"
 expect attributes-no-diff-clean-green 0 "PASS: gitleaks: no leaks found" -- \
@@ -2080,6 +2144,26 @@ for kind in accept reject; do
 done
 declare_dynamic_rows "$((accept_lines + reject_lines - 1))"
 
+expect gitleaks-config-no-path-skips 0 "gitleaks config: 222 rules, 0 paths/commits/extend keys" -- \
+	check_config_no_path_skips "$GITLEAKS_TOML"
+expect gitleaks-config-no-path-skips-catches-paths 1 "gitleaks config: 222 rules, 1 paths/commits/extend keys" -- \
+	check_config_no_path_skips "$(copy_with "$GITLEAKS_TOML" 'description = "global allow lists"' \
+		$'description = "global allow lists"\npaths = [\'\'\'x\'\'\']')"
+expect gitleaks-config-no-path-skips-catches-capitalized-paths 1 "gitleaks config: 222 rules, 1 paths/commits/extend keys" -- \
+	check_config_no_path_skips "$(copy_with "$GITLEAKS_TOML" 'description = "global allow lists"' \
+		$'description = "global allow lists"\nPaths = [\'\'\'x\'\'\']')"
+expect gitleaks-config-no-path-skips-catches-commits 1 "gitleaks config: 222 rules, 1 paths/commits/extend keys" -- \
+	check_config_no_path_skips "$(copy_with "$GITLEAKS_TOML" 'description = "global allow lists"' \
+		$'description = "global allow lists"\ncommits = ["x"]')"
+expect gitleaks-config-no-path-skips-catches-extend 1 "gitleaks config: 222 rules, 1 paths/commits/extend keys" -- \
+	check_config_no_path_skips "$(copy_with "$GITLEAKS_TOML" 'title = "gitleaks config"' \
+		$'title = "gitleaks config"\n[extend]\nuseDefault = true')"
+expect gitleaks-config-version 0 "gitleaks config version: 8.30.1" -- \
+	check_config_version "$GITLEAKS_TOML" "$FLOOR_SH"
+expect gitleaks-config-version-catches-drift 1 "gitleaks config version mismatch: config '8.30.0', floor.sh '8.30.1'" -- \
+	check_config_version "$(copy_with "$GITLEAKS_TOML" '# gitleaks v8.30.1 default config' '# gitleaks v8.30.0 default config')" "$FLOOR_SH"
+expect gitleaks-config-version-catches-pin-drift 1 "gitleaks config version mismatch: config '8.30.1', floor.sh '8.30.2'" -- \
+	check_config_version "$GITLEAKS_TOML" "$(floor_copy_with 'GITLEAKS_VERSION="8.30.1"' 'GITLEAKS_VERSION="8.30.2"')"
 expect precommit-gitleaks-rev-parity 0 "gitleaks rev parity: 8.30.1" -- \
 	check_gitleaks_rev_parity "$PRECOMMIT_CONFIG" "$FLOOR_SH"
 expect precommit-gitleaks-rev-parity-catches-drift 1 "gitleaks rev mismatch: hook 'v8.30.0', floor.sh '8.30.1'" -- \
