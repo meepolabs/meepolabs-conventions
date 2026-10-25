@@ -443,6 +443,7 @@ preflight_git_log() {
 		scan_fail "git log reported errors or warnings (exit $rc); history is not scannable"
 	fi
 	refuse_quoted_paths "${log_opts[@]}"
+	refuse_archives "${log_opts[@]}"
 }
 
 # gitleaks's diff parser (go-gitdiff v0.9.1, parseQuotedName) misreads some
@@ -458,13 +459,73 @@ refuse_quoted_paths() {
 	git_isolated -C . log --format= --name-only "$@" </dev/null 2>/dev/null |
 		grep -m 1 '^"' | head -c "$QUOTED_PATH_LIMIT" >"$out" || status=("${PIPESTATUS[@]}")
 	if [[ -s "$out" ]]; then
+		info "path git would quote: $(head -n 1 -- "$out")"
 		close_command_fence
-		scan_fail "path git would quote; history is not scannable: $(head -n 1 -- "$out")"
+		scan_fail "path git would quote; history is not scannable; see the path above"
 	fi
 	[[ "${status[0]}" == 0 && "${status[1]}" == 1 ]] || {
 		close_command_fence
 		scan_fail "cannot list the paths in the scan range (exit ${status[*]})"
 	}
+}
+
+# gitleaks reads an archive as its compressed bytes, so a secret inside one
+# passes. A file or symlink blob (gitleaks scans both) the walk adds or
+# modifies whose content starts with a gzip, zip, bzip2, xz, zstd or 7z
+# magic, or holds "ustar" at offset 257 (tar), fails the scan whatever its
+# name. A gitlink has no blob to read; any other --raw line fails closed.
+# Every checked blob goes through one cat-file stream; its header lengths and
+# blob sizes give each content start, where a magic must sit to count. The
+# path is repo-controlled, so it is printed only inside the command fence.
+refuse_archives() {
+	local oids="$WORK_DIR/archive-oids" raw="$WORK_DIR/archive-raw" hits="$WORK_DIR/archive-hits"
+	local magics="$WORK_DIR/archive-magics" sizes_file="$WORK_DIR/archive-sizes"
+	local oid path size off match pos=0 n=0 hexlen=0 found=""
+	local -A seen=() start=()
+	local -a paths=() sizes=() status=(0 0)
+	git_isolated -C . log --format= --raw --no-abbrev "$@" </dev/null 2>/dev/null |
+		sed -n -E -e '/^:[0-7]{6} (100[0-7]{3}|120000) [0-9a-f]+ ([0-9a-f]+) [AMT][0-9]*\t/{s//\2\t/p;d}' \
+			-e '/^:[0-7]{6} 160000 [0-9a-f]+ [0-9a-f]+ [AMT][0-9]*\t/d' -e '/^:/{s/.*/?/p}' >"$raw" ||
+		status=("${PIPESTATUS[@]}")
+	[[ "${status[*]}" == "0 0" ]] || archive_check_fail
+	while IFS=$'\t' read -r oid path; do
+		[[ "$oid" != "?" ]] || archive_check_fail " (unrecognized --raw line)"
+		[[ -z "${seen[$oid]:-}" ]] || continue
+		seen[$oid]=1
+		paths+=("$path") hexlen=${#oid}
+		printf '%s\n' "$oid"
+	done <"$raw" >"$oids"
+	git_isolated cat-file --batch-check='%(objectsize)' <"$oids" >"$sizes_file" 2>/dev/null || archive_check_fail
+	mapfile -t sizes <"$sizes_file"
+	((${#sizes[@]} == ${#paths[@]})) || archive_check_fail
+	for size in "${sizes[@]}"; do
+		[[ "$size" =~ ^[0-9]+$ ]] || archive_check_fail
+		pos=$((pos + hexlen + 1))
+		start[$pos]=$n
+		pos=$((pos + size + 1)) n=$((n + 1))
+	done
+	printf '\x1f\x8b\nPK\x03\x04\nPK\x05\x06\nPK\x07\x08\n\xfd7zXZ\0\n(\xb5/\xfd\n7z\xbc\xaf\x27\x1c\nustar\n' >"$magics"
+	printf 'BZh%s\n' 1 2 3 4 5 6 7 8 9 >>"$magics"
+	git_isolated cat-file --batch='%(objectname)' <"$oids" 2>/dev/null | grep -a -b -o -F -f "$magics" |
+		tr -c '0-9:u\n' . >"$hits" || status=("${PIPESTATUS[@]}")
+	[[ "${status[0]}" == 0 && "${status[1]}" != 2 && "${status[2]:-0}" == 0 ]] || archive_check_fail
+	while IFS=: read -r off match; do
+		[[ "$match" != u* ]] || off=$((off - 257))
+		n=${start[$off]:-}
+		[[ -n "$n" && ("$match" != u* || "${sizes[n]}" -ge 262) ]] || continue
+		found=${paths[n]}
+		break
+	done <"$hits"
+	[[ -z "$found" ]] || {
+		info "compressed archive in the scan range: $found; keep archives out of git"
+		close_command_fence
+		scan_fail "compressed archive in the scan range; see the path above"
+	}
+}
+
+archive_check_fail() {
+	close_command_fence
+	scan_fail "cannot check the scan range for archives${1:-}"
 }
 
 # Only the gitleaks.toml shipped next to this script applies: nothing the
@@ -523,7 +584,9 @@ run_gitleaks() {
 }
 
 # A tracked path as one printable log line: a name holding a newline or other
-# control character is shell-quoted, so it cannot start a workflow command.
+# control character is shell-quoted, so it cannot start a "::" command on a
+# line of its own. "##[" still parses anywhere in a line, so callers print the
+# result only inside a command fence.
 printable_path() {
 	if [[ "$1" =~ [^[:print:]] ]]; then
 		printf '%q' "$1"
@@ -626,9 +689,11 @@ check_lockfiles() {
 		fi
 	done <"$listing"
 	if ((${#unscannable[@]} > 0)); then
+		open_command_fence
 		for entry in "${unscannable[@]}"; do
-			printf 'security-floor: osv-scanner cannot scan %s\n' "$(printable_path "$entry")" >&2
+			printf 'security-floor: osv-scanner cannot scan %s\n' "$(printable_path "$entry")"
 		done
+		close_command_fence
 		LOCKFILE_CHECK="FAIL, ${#unscannable[@]} unscannable dependency file entries"
 		osv_fail "lockfile check: ${#unscannable[@]} dependency file entries osv-scanner cannot scan"
 	fi
@@ -642,9 +707,11 @@ check_lockfiles() {
 		manifest_has_lockfile "$manifest" || lockless+=("$manifest")
 	done
 	if ((${#lockless[@]} > 0)); then
+		open_command_fence
 		for manifest in "${lockless[@]}"; do
-			printf 'security-floor: no tracked lockfile for manifest: %s\n' "$(printable_path "$manifest")" >&2
+			printf 'security-floor: no tracked lockfile for manifest: %s\n' "$(printable_path "$manifest")"
 		done
+		close_command_fence
 		LOCKFILE_CHECK="FAIL, ${#lockless[@]} manifest(s) without a tracked lockfile"
 		osv_fail "lockfile check: ${#lockless[@]} manifest(s) without a tracked lockfile in their directory or a parent"
 	fi
@@ -731,9 +798,11 @@ require_lockfiles_scanned() {
 		[[ -n "${scanned["$root/$path"]:-}" ]] || missing+=("$path")
 	done
 	((${#missing[@]} == 0)) && return 0
+	open_command_fence
 	for path in "${missing[@]}"; do
-		printf 'security-floor: lockfile produced no packages: %s\n' "$(printable_path "$path")" >&2
+		printf 'security-floor: lockfile produced no packages: %s\n' "$(printable_path "$path")"
 	done
+	close_command_fence
 	write_osv_summary "FAIL, lockfile produced no packages" "$table"
 	fail "osv: lockfile produced no packages: ${#missing[@]} tracked lockfile(s)"
 }

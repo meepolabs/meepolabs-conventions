@@ -8,6 +8,9 @@
   and binary extensions; the action now ships that config with every
   path skip removed. Its checks for placeholder values stay. A secret in
   a previously skipped file turns the scan red.
+- The secret scan fails when the scanned commits add or change a
+  compressed archive (gzip, zip, tar, bzip2, xz, zstd or 7z, detected by
+  content), since gitleaks cannot see inside one.
 
 ## v1.0.0
 

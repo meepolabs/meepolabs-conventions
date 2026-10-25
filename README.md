@@ -164,8 +164,11 @@ resolving a merge.
 gitleaks runs with the rules of its default config, shipped with the
 action as `actions/security-floor/gitleaks.toml`. No file is skipped by
 path: every file's content is scanned as stored in git, lockfiles,
-vendored code, images and binaries included; compressed archives (`.gz`,
-`.zip`, ...) are not unpacked. gitleaks's checks for placeholder values
+vendored code, images and binaries included. gitleaks cannot see inside a
+compressed archive, so a commit in the scanned range that adds or changes
+one (gzip, zip, tar, bzip2, xz, zstd or 7z, recognized by content, not by
+name) fails the step: `compressed archive in the scan range; see the path
+above`, with the path and `keep archives out of git` on the line before. gitleaks's checks for placeholder values
 (such as `${{ secrets.NAME }}` or `$VAR`) stay, so a reference to a
 secret is not a finding. Nothing in the scanned repository can relax the verdict:
 
@@ -228,7 +231,8 @@ partially:
 - A merge with 3 or more parents in the scan range: `octopus merge in
   scan range; not scannable`.
 - A file name git must quote (a control character, `"` or `\`) anywhere
-  in the scan range: `path git would quote; history is not scannable`.
+  in the scan range: `path git would quote; history is not scannable; see
+  the path above`, with the quoted path on the line before.
 - Any error or warning from git while walking the history: `git log
   reported errors or warnings (exit N); history is not scannable`.
 - git older than 2.36: `git 2.36 or newer is required`.

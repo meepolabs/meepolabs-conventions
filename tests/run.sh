@@ -406,15 +406,24 @@ run_floor_fenced() {
 }
 
 # run_floor_no_bare_commands <repo> <subcommand> [NAME=VALUE...]: runs the
-# subcommand, then returns 3 if any log line other than a stop-commands fence
-# line starts a workflow command, else the floor's exit code.
+# subcommand, then returns 3 if any log line outside a stop-commands fence
+# starts with "::" after optional whitespace or holds "##[" anywhere (the
+# runner parses both), else the floor's exit code.
 run_floor_no_bare_commands() {
-	local repo=$1 sub=$2 log rc=0 bare
+	local repo=$1 sub=$2 log rc=0 line token="" bare=0
 	shift 2
 	log=$(mktemp "$WORK/bare.XXXXXX")
 	run_floor "$repo" "$sub" "$@" >"$log" 2>&1 || rc=$?
 	cat -- "$log"
-	bare=$(grep -E '^::' -- "$log" | grep -cvE '^::(stop-commands::[0-9a-f]{32}|[0-9a-f]{32}::)$' || true)
+	while IFS= read -r line; do
+		if [[ -z "$token" && "$line" =~ ^::stop-commands::([0-9a-f]{32})$ ]]; then
+			token=${BASH_REMATCH[1]}
+		elif [[ -n "$token" ]]; then
+			[[ "$line" != "::$token::" ]] || token=""
+		elif [[ "$line" =~ ^[[:space:]]*:: || "$line" == *'##['* ]]; then
+			bare=$((bare + 1))
+		fi
+	done <"$log"
 	echo "bare workflow commands: $bare"
 	[[ "$bare" == 0 ]] || return 3
 	return "$rc"
@@ -664,6 +673,39 @@ files_repo() {
 		fi
 		shift 2
 	done
+	printf '%s\n' "$repo"
+}
+
+# archive_repo <format> <path> <secret>: commits <path> holding an app.env
+# with the secret packed as <format> (gzip, zip, tar; symlink: a symlink
+# entry whose target bytes are the gzip). Prints the repo.
+archive_repo() {
+	local repo src
+	repo=$(new_repo)
+	commit_file "$repo" README.md "fixture" >/dev/null
+	src=$(mktemp -d "$WORK/archive-src.XXXXXX")
+	printf 'API_TOKEN=%s\n' "$3" >"$src/app.env"
+	case "$1" in
+	gzip) gzip -c -- "$src/app.env" >"$repo/$2" ;;
+	zip) (cd -- "$src" && zip -q -X - app.env) >"$repo/$2" ;;
+	tar) tar -C "$src" -cf "$repo/$2" app.env ;;
+	symlink)
+		git -C "$repo" update-index --add --cacheinfo \
+			"120000,$(gzip -c -- "$src/app.env" | git -C "$repo" hash-object -w --stdin),$2"
+		;;
+	esac
+	[[ "$1" == symlink ]] || git -C "$repo" add -- "$2"
+	git_in "$repo" commit -q -m "add $2"
+	printf '%s\n' "$repo"
+}
+
+# png_repo: a PNG-headed binary that holds a gzip magic past its first byte.
+png_repo() {
+	local repo
+	repo=$(new_repo)
+	printf '\x89PNG\r\n\x1a\n\x00\x00\x1f\x8b\x08ustar' >"$repo/logo.png"
+	git -C "$repo" add -- logo.png
+	git_in "$repo" commit -q -m "add logo.png"
 	printf '%s\n' "$repo"
 }
 
@@ -1577,6 +1619,7 @@ grafted_repo=$(graft_repo "$secret")
 backslash_name_repo=$(files_repo "t\\" "API_TOKEN=$secret")
 read -r backslash_pr_repo backslash_pr_base backslash_pr_head < <(trailing_backslash_pr_repo "$secret")
 backslash_merge_repo=$(quoted_name_merge_repo)
+quoted_command_name_repo=$(files_repo 'a ##[warning]x"' "fixture")
 utf8_name=$'caf\xc3\xa9.env'
 utf8_secret_repo=$(files_repo "$utf8_name" "API_TOKEN=$secret")
 utf8_clean_repo=$(files_repo "$utf8_name" "API_TOKEN=unset")
@@ -1589,6 +1632,19 @@ floor_no_path_check_short_timeout=$(copy_with "$floor_no_path_check" \
 term_marker="$WORK/git-log-started"
 # shellcheck disable=SC2016 # literal stub text
 slow_git_log_stub='git=case " $* " in *" log -p -U0 "*) : >'"'$term_marker'"'; sleep 60 ;; esac; exec /usr/bin/git "$@"'
+gz_secret_repo=$(archive_repo gzip app.env.gz "$secret")
+gz_renamed_repo=$(archive_repo gzip data.bin "$secret")
+zip_secret_repo=$(archive_repo zip bundle.zip "$secret")
+tar_secret_repo=$(archive_repo tar bundle.tar "$secret")
+gz_symlink_repo=$(archive_repo symlink cfg.gz "$secret")
+gz_command_name_repo=$(archive_repo gzip 'a ##[warning]x.gz' "$secret")
+png_clean_repo=$(png_repo)
+gz_removed_repo=$(archive_repo gzip app.env.gz "$secret")
+git_in "$gz_removed_repo" rm -q -- app.env.gz
+git_in "$gz_removed_repo" commit -q -m "remove app.env.gz"
+gz_removed_head=$(git -C "$gz_removed_repo" rev-parse HEAD)
+# shellcheck disable=SC2016 # literal stub text
+unknown_mode_git_stub='git=case " $* " in *" --raw "*) printf ":000000 140000 %040d %040d A\\tx\\n" 0 1; exit 0 ;; esac; exec /usr/bin/git "$@"'
 # shellcheck disable=SC2016 # literal stub text
 old_git_stub='git=[ "$1" = version ] && { echo "git version 2.35.8"; exit 0; }; exec /usr/bin/git "$@"'
 
@@ -1626,6 +1682,8 @@ ev_pr_long=$(pr_event pr-long "$long_base" "$long_head")
 ev_pr_scoped=$(pr_event pr-scoped "$scoped_base" "$scoped_head")
 ev_pr_after_secret=$(pr_event pr-after-secret "$range_c2" "$range_c3")
 ev_pr_head_newline=$(pr_event pr-head-newline "$range_c2" "$range_c3"$'\n')
+ev_gz_removed=$(push_event gz-removed "$(git -C "$gz_removed_repo" rev-parse HEAD~1)" "$gz_removed_head")
+ev_gz_added_removed=$(push_event gz-added-removed "$(git -C "$gz_removed_repo" rev-parse HEAD~2)" "$gz_removed_head")
 ev_pr_missing="$WORK/event-pr-missing.json"
 jq -n --arg h "$range_c3" '{pull_request: {head: {sha: $h}}}' >"$ev_pr_missing"
 
@@ -1823,6 +1881,11 @@ expect osv-untracked-lockfile-red 1 "no tracked lockfile for manifest: package.j
 # shellcheck disable=SC2016 # literal expected output
 expect osv-control-char-path-quoted-red 1 "no tracked lockfile for manifest: \$'dir\\n::warning::x/package.json'" -- \
 	run_floor "$osv_newline_name_repo" osv
+# "##[" is parsed anywhere in a line and survives printable_path, so the
+# per-path lines are printed only inside the command fence.
+expect osv-path-workflow-command-fenced-red 1 "security-floor: no tracked lockfile for manifest: a ##[warning]x/package.json" \
+	--contains "bare workflow commands: 0" -- \
+	run_floor_no_bare_commands "$(files_repo 'a ##[warning]x/package.json' "$pkg_json")" osv
 
 # The tracked-file listing reads no HOME git config. The control shows the
 # fixture's hook runs for a plain git command.
@@ -1985,6 +2048,45 @@ expect binary-extension-secret-red 1 "FAIL: gitleaks: leaks found" --contains "F
 expect lockfile-secret-red 1 "FAIL: gitleaks: leaks found" --contains "File:        pnpm-lock.yaml" -- \
 	run_floor "$lockfile_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 
+# gitleaks never unpacks an archive, so any archive the range adds or
+# modifies fails the scan, detected by content rather than name. A file whose
+# only change in the range is its deletion does not count.
+expect archive-gz-secret-red 1 "FAIL: compressed archive in the scan range; see the path above" \
+	--contains "security-floor: compressed archive in the scan range: app.env.gz; keep archives out of git" -- \
+	run_floor "$gz_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-gz-renamed-bin-red 1 "compressed archive in the scan range: data.bin;" -- \
+	run_floor "$gz_renamed_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-zip-red 1 "compressed archive in the scan range: bundle.zip;" -- \
+	run_floor "$zip_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-tar-red 1 "compressed archive in the scan range: bundle.tar;" -- \
+	run_floor "$tar_secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-symlink-gz-red 1 "compressed archive in the scan range: cfg.gz;" -- \
+	run_floor "$gz_symlink_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# A gitlink has no blob and is skipped by mode; any --raw line the filter does
+# not recognize (here a stubbed mode 140000) fails closed.
+expect archive-check-gitlink-skipped-green 0 "PASS: gitleaks: no leaks found" --absent "archives" -- \
+	run_floor "$osv_gitlink_lock_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-check-unknown-mode-red 1 "FAIL: cannot check the scan range for archives (unrecognized --raw line)" -- \
+	run_floor_script "$(floor_with_stubs_on_path "$unknown_mode_git_stub")" "$clean_repo" gitleaks \
+	GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+# The archive's path is repo-controlled: it is printed only inside the
+# command fence, and neither the failure line nor the job summary carries it.
+expect archive-path-workflow-command-fenced-red 1 "FAIL: compressed archive in the scan range; see the path above" \
+	--contains "security-floor: compressed archive in the scan range: a ##[warning]x.gz" \
+	--contains "bare workflow commands: 0" -- \
+	run_floor_no_bare_commands "$gz_command_name_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-path-not-in-summary-red 1 "summary: - result: FAIL, compressed archive in the scan range; see the path above" \
+	--absent "##[" -- \
+	run_floor_summary_only "$gz_command_name_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-png-green 0 "PASS: gitleaks: no leaks found" --absent "compressed archive" -- \
+	run_floor "$png_clean_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+expect archive-added-then-deleted-red 1 "compressed archive in the scan range: app.env.gz;" -- \
+	run_floor "$gz_removed_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_gz_added_removed"
+expect archive-deletion-only-green 0 "PASS: gitleaks: no leaks found" --absent "compressed archive" -- \
+	run_floor "$gz_removed_repo" gitleaks GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$ev_gz_removed"
+expect archive-check-plain-env-secret-red 1 "FAIL: gitleaks: leaks found" --absent "compressed archive" -- \
+	run_floor "$secret_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
+
 # The shipped config must be present and match its pinned hash: an empty or
 # edited one could load no rules, and there is no fallback to gitleaks's
 # defaults. The modified copy differs by one character.
@@ -2024,10 +2126,14 @@ expect git-log-preflight-clean-history-green 0 "PASS: gitleaks: no leaks found" 
 # gitleaks's diff parser stops, with nothing on git stderr, at a name git
 # quotes, so any quoted name in the walk fails the scan. UTF-8 names are not
 # quoted (core.quotePath=false) and scan normally.
-expect schedule-backslash-name-secret-red 1 'FAIL: path git would quote; history is not scannable: "t\\"' -- \
+expect schedule-backslash-name-secret-red 1 'security-floor: path git would quote: "t\\"' \
+	--contains "FAIL: path git would quote; history is not scannable; see the path above" -- \
 	run_floor "$backslash_name_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect pr-backslash-name-hides-older-secret-red 1 "FAIL: path git would quote; history is not scannable" -- \
 	run_floor "$backslash_pr_repo" gitleaks GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$ev_pr_backslash"
+expect quoted-path-workflow-command-fenced-red 1 'security-floor: path git would quote: "a ##[warning]x\""' \
+	--contains "bare workflow commands: 0" -- \
+	run_floor_no_bare_commands "$quoted_command_name_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect schedule-backslash-name-in-merge-resolution-red 1 "FAIL: path git would quote; history is not scannable" -- \
 	run_floor "$backslash_merge_repo" gitleaks GITHUB_EVENT_NAME=schedule GITHUB_EVENT_PATH="$other_event"
 expect schedule-utf8-name-secret-red 1 "FAIL: gitleaks: leaks found" --absent "path git would quote" -- \
