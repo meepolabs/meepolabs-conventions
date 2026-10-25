@@ -90,7 +90,7 @@ Every failure prints a `security-floor: FAIL:` line.
 - **A compressed archive** (gzip, zip, tar and similar, by content, so
   `.jar`, `.whl` and `.docx` count) in the scanned commits: the scan
   cannot read inside it. Keep archives out of git.
-- **A vulnerable dependency:** upgrade it.
+- **A vulnerable dependency:** see [Vulnerable dependencies](#vulnerable-dependencies).
 - **A manifest without a tracked lockfile** (`package.json`,
   `pyproject.toml`, `Cargo.toml`): commit the lockfile.
 - **A dependency file the scan cannot read** (a symlink, a submodule
@@ -99,6 +99,24 @@ Every failure prints a `security-floor: FAIL:` line.
 - **History the scan cannot read in full** (a shallow or partial clone,
   an octopus merge, a file name git must quote): the message names the
   cause; fix the checkout or the history.
+
+### Vulnerable dependencies
+
+The dependency scan and Dependabot alerts report the same kind of
+finding. Handle both the same way; there is no ignore list.
+
+- **A fixed version at least 14 days old:** fix it now, in its own pull
+  request to `develop`. Renovate opens that pull request at any time when
+  GitHub has a Dependabot alert for the package.
+- **A fix younger than 14 days:** it arrives in the weekly update once it
+  is 14 days old. Take it earlier only for a high or critical
+  vulnerability in code that runs in production; that is a maintainer
+  decision.
+- **A fix that needs a major upgrade:** plan the upgrade as its own work.
+- **No fix yet:** remove the package, or wait.
+
+Until the fix lands, the scan stays red on every pull request in the
+repository.
 
 ## Renovate preset
 
@@ -111,9 +129,10 @@ one is published:
 
 It sets grouped updates on `develop` once a week (Saturday, 10:00-15:59
 UTC), a 14-day wait before a new release is proposed, SHA-pinned
-actions, and manual review of majors.
-Keep stack-specific groups and repository quirks in the repository's own
-`renovate.json`.
+actions, and manual review of majors. Exact version pins apply only to
+npm and GitHub Actions; a repository that pins every manager keeps that
+rule in its own config. Keep stack-specific groups and repository quirks
+in the repository's own `renovate.json`.
 
 Renovate replaces Dependabot's pull requests. Once Renovate is running
 in a repository:
