@@ -10,3 +10,4 @@
 | `tests/id-hook/` | Accept and reject lines for the `no-internal-ids` pre-commit hook |
 | `.github/workflows/self-test.yml` | CI: pre-commit, the self-test, and the action run against this repository with positive and negative controls |
 | `.pre-commit-config.yaml` | Hooks for this repository |
+| `renovate.json` | This repository's Renovate config: the shared preset, pinned to a release tag |
