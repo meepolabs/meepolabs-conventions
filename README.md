@@ -10,9 +10,10 @@ every repository pulls them from here instead of copying them.
 
 ## Versions
 
-Releases are tagged `vX.Y.Z`. A major version changes how the pieces are
-used. A minor or patch version can still make a check stricter, for
-example by closing a gap in a scan, and turn a passing repository red.
+Releases are tagged `vX.Y.Z`. Before v1.0.0, a minor version can change
+how the pieces are used. A patch version does not, but any release can
+make a check stricter, for example by closing a gap in a scan, and turn
+a passing repository red.
 Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security floor

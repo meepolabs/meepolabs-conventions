@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---|---|
-| v1.x | Yes |
+| Latest 0.x release | Yes |
 
-Fixes ship as a new v1.x release. Callers pin the action by commit SHA
+Fixes ship as a new release. Callers pin the action by commit SHA
 and the Renovate preset by tag, so adopting a fix means moving the pin.
 
 ## Reporting a vulnerability
