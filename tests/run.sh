@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Self-test for actions/security-floor (floor.sh, action.yml) and the
-# pre-commit config. Needs network access, git, curl, jq, yq, pre-commit and
-# sha256sum. Every fixture is generated at runtime, except the id-hook line
-# lists under tests/id-hook/.
+# pre-commit config. Needs network access, git, curl, jq, yq, pre-commit,
+# sha256sum, gzip and zip. Every fixture is generated at runtime, except the
+# id-hook line lists under tests/id-hook/.
 #
 # Row contract: expect <name> <exit> <grep-text> [--contains <text>]
 #                      [--absent <text>] -- cmd...

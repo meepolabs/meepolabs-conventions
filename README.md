@@ -10,8 +10,9 @@ every repository pulls them from here instead of copying them.
 
 ## Versions
 
-Releases are tagged `vX.Y.Z`. A major version can make a check stricter
-and turn a passing repository red; minor and patch versions do not.
+Releases are tagged `vX.Y.Z`. A major version changes how the pieces are
+used. A minor or patch version can still make a check stricter, for
+example by closing a gap in a scan, and turn a passing repository red.
 Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Security floor
@@ -22,8 +23,8 @@ runs even when the first fails.
 1. **Secret scan** (gitleaks): on `push` and `pull_request`, the commits
    they introduce; on any other event, the full history of all branches
    and tags. Every file is scanned; nothing is skipped by
-   path, and the repository cannot allowlist anything (`.gitleaks.toml`,
-   `.gitleaksignore` and `gitleaks:allow` are not honored).
+   path, and the repository cannot allowlist anything (`.gitleaks.toml`
+   and `gitleaks:allow` are ignored; a `.gitleaksignore` fails the scan).
 2. **Dependency scan** (osv-scanner): every lockfile in the checkout,
    with no ignore list.
 
@@ -33,7 +34,10 @@ has no inputs and needs only `contents: read`.
 ### Usage
 
 Pin the action by the commit SHA of a release tag, with the tag as a
-comment, and run it first in its job, right after checkout:
+comment, and run it first in its job, right after checkout. Get the SHA
+with `git ls-remote https://github.com/meepolabs/meepolabs-conventions
+'refs/tags/vX.Y.Z^{}' refs/tags/vX.Y.Z` (use the `^{}` line when there
+is one):
 
 ```yaml
 name: security
@@ -79,11 +83,15 @@ Every failure prints a `security-floor: FAIL:` line.
 
 - **A leak:** rewrite the value out of history, and rotate it if it was
   real. Fake secrets in tests count too: generate them at test time.
-- **A compressed archive** (gzip, zip, tar and similar) in the scanned
-  commits: the scan cannot read inside it. Keep archives out of git.
+- **A compressed archive** (gzip, zip, tar and similar, by content, so
+  `.jar`, `.whl` and `.docx` count) in the scanned commits: the scan
+  cannot read inside it. Keep archives out of git.
 - **A vulnerable dependency:** upgrade it.
 - **A manifest without a tracked lockfile** (`package.json`,
   `pyproject.toml`, `Cargo.toml`): commit the lockfile.
+- **A dependency file the scan cannot read** (a symlink, a submodule
+  entry, a lockfile under `node_modules/`, or a lockfile with no
+  packages): the message names the path.
 - **History the scan cannot read in full** (a shallow or partial clone,
   an octopus merge, a file name git must quote): the message names the
   cause; fix the checkout or the history.
